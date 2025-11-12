@@ -185,6 +185,7 @@ class MimicReward(TrajectoryBasedReward):
         self._joint_acc_coeff = kwargs.get("joint_acc_coeff", 0.0)
         self._joint_torque_coeff = kwargs.get("joint_torque_coeff", 0.0)
         self._action_rate_coeff = kwargs.get("action_rate_coeff", 0.0)
+        self._action_size_coeff = kwargs.get("action_size_coeff", 0.0)
 
         # get main body name of the environment
         self.main_body_name = self._info_props["upper_body_xml_name"]
@@ -373,12 +374,20 @@ class MimicReward(TrajectoryBasedReward):
         else:
             action_rate_reward = 0.0
 
+        # action size reward
+        if self._action_rate_coeff > 0.0:
+            action_size_norm = backend.sum(backend.square(action))
+            action_size_reward = self._action_size_coeff * -action_size_norm    
+        else:
+            action_size_reward = 0.0
+
         # total penality rewards
         total_penalities = (self._action_out_of_bounds_coeff * out_of_bound_reward
                             + self._joint_acc_coeff * acceleration_reward
                             + self._joint_torque_coeff * torque_reward
-                            + self._action_rate_coeff * action_rate_reward)
-        total_penalities = backend.maximum(total_penalities, -1.0)
+                            + self._action_rate_coeff * action_rate_reward
+                            + self._action_size_coeff * action_size_reward
+                            )
 
         # calculate total reward
         total_reward = (self._qpos_w_sum * qpos_reward + self._qvel_w_sum * qvel_reward)
