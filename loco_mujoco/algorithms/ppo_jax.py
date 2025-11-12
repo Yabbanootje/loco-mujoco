@@ -8,6 +8,7 @@ from omegaconf import DictConfig, OmegaConf, ListConfig
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax_tqdm import scan_tqdm
 from flax import struct
 import flax
 import optax
@@ -172,6 +173,7 @@ class PPOJax(JaxRLAlgorithmBase):
         train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)
 
         # TRAIN LOOP
+        @scan_tqdm(config.num_updates, print_rate=1, desc='PPO JAX Training')
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
@@ -405,7 +407,7 @@ class PPOJax(JaxRLAlgorithmBase):
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, train_state_buffer, _rng)
         runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, None, config.num_updates
+            _update_step, runner_state, jnp.arange(config.num_updates)
         )
 
         agent_state = cls._agent_state(train_state=runner_state[0])
