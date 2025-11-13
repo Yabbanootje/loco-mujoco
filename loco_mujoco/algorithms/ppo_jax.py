@@ -13,7 +13,7 @@ from flax import struct
 import flax
 import optax
 
-from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic,
+from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic, LatticeActorCritic,
                                     Transition, TrainState, TrainStateBuffer, MetricHandlerTransition)
 from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
@@ -95,7 +95,8 @@ class PPOJax(JaxRLAlgorithmBase):
                                              for i in range(config.experiment.len_obs_history)])
             critic_obs_ind = jnp.concatenate([critic_obs_ind + i*obs_len
                                               for i in range(config.experiment.len_obs_history)])
-        network = ActorCritic(
+        cls = LatticeActorCritic if config.experiment.use_lattice else ActorCritic
+        network = cls(
             env.info.action_space.shape[0],
             activation=config.experiment.activation,
             init_std=config.experiment.init_std,
@@ -444,7 +445,11 @@ class PPOJax(JaxRLAlgorithmBase):
         train_state = agent_state.train_state
 
         if deterministic:
-            train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
+            if config.experiment.use_lattice:
+                train_state.params["mean_log_std"] = np.ones_like(train_state.params["mean_log_std"]) * -np.inf
+                train_state.params["latent_log_std"] = np.ones_like(train_state.params["latent_log_std"]) * -np.inf
+            else:
+                train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
         if config.n_seeds > 1:
             assert train_state_seed is not None, ("Loaded train state has multiple seeds. Please specify "

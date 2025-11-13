@@ -47,6 +47,26 @@ class FullyConnectedNet(nn.Module):
 
         return jnp.squeeze(x) if self.squeeze_output else x
 
+class LatticeLatentNet(FullyConnectedNet):
+
+    hidden_layer_dims: Sequence[int]
+    activation: str = "tanh"
+    output_activation: str = None    # none means linear activation
+    use_running_mean_stand: bool = True
+
+    @nn.compact
+    def __call__(self, x):
+
+        if self.use_running_mean_stand:
+            x = RunningMeanStd()(x)
+
+        # build network
+        for i, dim_layer in enumerate(self.hidden_layer_dims):
+            x = nn.Dense(dim_layer, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+            x = self.activation_fn(x)
+
+        return x
+
 
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
@@ -75,6 +95,55 @@ class ActorCritic(nn.Module):
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+
+        # build critic
+        critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
+        critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
+
+        return pi, jnp.squeeze(critic, axis=-1)
+
+class LatticeActorCritic(ActorCritic):
+    action_dim: Sequence[int]
+    activation: str = "tanh"
+    init_std: float = 1.0
+    learnable_std: bool = True
+    hidden_layer_dims: Sequence[int] = (1024, 512)
+    actor_obs_ind: jnp.ndarray = None
+    critic_obs_ind: jnp.ndarray = None
+
+    @nn.compact
+    def __call__(self, x):
+
+        x = RunningMeanStd()(x)
+
+        # build actor
+        actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
+        # seperate latent from output layer
+        actor_latent = LatticeLatentNet(self.hidden_layer_dims, self.activation,
+                                       "tanh", False, False)(actor_x)
+        actor_mean = nn.Dense(self.output_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_latent)
+        actor_mean = self.output_activation_fn(actor_mean)
+
+        # add lattice noise
+        # get log(S_a)
+        actor_mean_logtstd = self.param("mean_log_std", nn.initializers.constant(jnp.log(self.init_std)),
+                                   (self.hidden_layer_dims[-1], self.action_dim))
+        if not self.learnable_std:
+            actor_mean_logtstd = jax.lax.stop_gradient(actor_mean_logtstd)
+        # get log(S_x)
+        actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
+                                   (self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
+        if not self.learnable_std:
+            actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
+        # compute S_a^2 * x^2
+        actor_mean_var =jnp.square(jnp.exp(actor_mean_logtstd)) @ jnp.square(actor_latent)
+        # compute S_x^2 * x^2
+        actor_latent_var = jnp.square(jnp.exp(actor_latent_logtstd)) @ jnp.square(actor_latent)
+        # compute total covariance W * Diag(S_x^2 * x^2) * W^T + Diag(S_a^2 * x^2)
+        actor_covar = actor_mean.weight @ jnp.diag(actor_latent_var) @ actor_mean.weight.T + jnp.diag(actor_mean_var)
+
+        # create policy using the mean W * x and the covariance
+        pi = distrax.MultivariateNormalFromBijector(actor_mean, actor_covar)
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
