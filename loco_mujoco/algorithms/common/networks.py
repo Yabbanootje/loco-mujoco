@@ -68,7 +68,7 @@ class ActorCritic(nn.Module):
         # build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
         actor_mean = FullyConnectedNet(self.hidden_layer_dims, self.action_dim, self.activation,
-                                       None, False, False)(actor_x)
+                                       "tanh", False, False)(actor_x)
         actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                    (self.action_dim,))
         if not self.learnable_std:
