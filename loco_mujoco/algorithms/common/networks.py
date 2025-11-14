@@ -146,11 +146,11 @@ class LatticeActorCritic(nn.Module):
         if not self.learnable_std:
             actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
         # compute S_a^2 * x^2
-        actor_mean_var = jnp.einsum("ah,...h->...a", jnp.square(jnp.exp(actor_mean_logtstd)), jnp.square(actor_latent))
+        actor_mean_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * actor_mean_logtstd), jnp.square(actor_latent))
         # compute S_x^2 * x^2
-        actor_latent_var = jnp.einsum("ah,...h->...a", jnp.square(jnp.exp(actor_latent_logtstd)), jnp.square(actor_latent))
+        actor_latent_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * actor_latent_logtstd), jnp.square(actor_latent))
         # get W
-        final_layer_weights = self.get_variable("params", "W")["kernel"].T
+        final_layer_weights = self.get_variable("params", "W")["kernel"].mT
         # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2)
         covx = jnp.einsum("ah,...h,jh->...aj", final_layer_weights, actor_latent_var, final_layer_weights)
         cova = jnp.einsum("...i,ij->...ij", actor_mean_var, jnp.eye(self.action_dim, dtype=actor_mean_var.dtype))
