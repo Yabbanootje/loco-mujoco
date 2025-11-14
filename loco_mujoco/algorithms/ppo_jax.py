@@ -95,8 +95,8 @@ class PPOJax(JaxRLAlgorithmBase):
                                              for i in range(config.experiment.len_obs_history)])
             critic_obs_ind = jnp.concatenate([critic_obs_ind + i*obs_len
                                               for i in range(config.experiment.len_obs_history)])
-        cls = LatticeActorCritic if config.experiment.use_lattice else ActorCritic
-        network = cls(
+        actorcritic_class = LatticeActorCritic if config.experiment.use_lattice is not None and config.experiment.use_lattice else ActorCritic
+        network = actorcritic_class(
             env.info.action_space.shape[0],
             activation=config.experiment.activation,
             init_std=config.experiment.init_std,
@@ -188,6 +188,8 @@ class PPOJax(JaxRLAlgorithmBase):
                 pi, value = y
                 train_state = train_state.replace(run_stats=updates['run_stats'])   # update stats
                 action = pi.sample(seed=_rng)
+                if config.experiment.debug:
+                    jax.debug.print("action: {s} {x}", s=action.shape, x=action)
                 log_prob = pi.log_prob(action)
 
                 # STEP ENV

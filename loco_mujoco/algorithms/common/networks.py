@@ -47,12 +47,15 @@ class FullyConnectedNet(nn.Module):
 
         return jnp.squeeze(x) if self.squeeze_output else x
 
-class LatticeLatentNet(FullyConnectedNet):
+class LatticeLatentNet(nn.Module):
 
     hidden_layer_dims: Sequence[int]
     activation: str = "tanh"
     output_activation: str = None    # none means linear activation
     use_running_mean_stand: bool = True
+
+    def setup(self):
+        self.activation_fn = get_activation_fn(self.activation)
 
     @nn.compact
     def __call__(self, x):
@@ -102,14 +105,20 @@ class ActorCritic(nn.Module):
 
         return pi, jnp.squeeze(critic, axis=-1)
 
-class LatticeActorCritic(ActorCritic):
+class LatticeActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
+    output_activation: str = "tanh"
     init_std: float = 1.0
     learnable_std: bool = True
     hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
     critic_obs_ind: jnp.ndarray = None
+
+    def setup(self):
+        self.activation_fn = get_activation_fn(self.activation)
+        self.output_activation_fn = get_activation_fn(self.output_activation) \
+            if self.output_activation is not None else lambda x: x
 
     @nn.compact
     def __call__(self, x):
@@ -120,14 +129,15 @@ class LatticeActorCritic(ActorCritic):
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
         # seperate latent from output layer
         actor_latent = LatticeLatentNet(self.hidden_layer_dims, self.activation,
-                                       "tanh", False, False)(actor_x)
-        actor_mean = nn.Dense(self.output_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_latent)
+                                       "tanh", False)(actor_x)
+        final_layer = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="W")
+        actor_mean = final_layer(actor_latent)
         actor_mean = self.output_activation_fn(actor_mean)
 
         # add lattice noise
         # get log(S_a)
         actor_mean_logtstd = self.param("mean_log_std", nn.initializers.constant(jnp.log(self.init_std)),
-                                   (self.hidden_layer_dims[-1], self.action_dim))
+                                   (self.action_dim, self.hidden_layer_dims[-1]))
         if not self.learnable_std:
             actor_mean_logtstd = jax.lax.stop_gradient(actor_mean_logtstd)
         # get log(S_x)
@@ -136,19 +146,22 @@ class LatticeActorCritic(ActorCritic):
         if not self.learnable_std:
             actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
         # compute S_a^2 * x^2
-        actor_mean_var =jnp.square(jnp.exp(actor_mean_logtstd)) @ jnp.square(actor_latent)
+        actor_mean_var = jnp.einsum("ah,...h->...a", jnp.square(jnp.exp(actor_mean_logtstd)), jnp.square(actor_latent))
         # compute S_x^2 * x^2
-        actor_latent_var = jnp.square(jnp.exp(actor_latent_logtstd)) @ jnp.square(actor_latent)
-        # compute total covariance W * Diag(S_x^2 * x^2) * W^T + Diag(S_a^2 * x^2)
-        actor_covar = actor_mean.weight @ jnp.diag(actor_latent_var) @ actor_mean.weight.T + jnp.diag(actor_mean_var)
+        actor_latent_var = jnp.einsum("ah,...h->...a", jnp.square(jnp.exp(actor_latent_logtstd)), jnp.square(actor_latent))
+        # get W
+        final_layer_weights = self.get_variable("params", "W")["kernel"].T
+        # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2)
+        covx = jnp.einsum("ah,...h,jh->...aj", final_layer_weights, actor_latent_var, final_layer_weights)
+        cova = jnp.einsum("...i,ij->...ij", actor_mean_var, jnp.eye(self.action_dim, dtype=actor_mean_var.dtype))
+        actor_covar = covx + cova
 
         # create policy using the mean W * x and the covariance
-        pi = distrax.MultivariateNormalFromBijector(actor_mean, actor_covar)
+        pi = distrax.MultivariateNormalFullCovariance(actor_mean, actor_covar)
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
         critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
-
         return pi, jnp.squeeze(critic, axis=-1)
 
 
