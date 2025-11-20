@@ -111,6 +111,7 @@ class LatticeActorCritic(nn.Module):
     output_activation: str = "tanh"
     init_std: float = 1.0
     learnable_std: bool = True
+    full_latent_matrix: bool = False
     hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
     critic_obs_ind: jnp.ndarray = None
@@ -140,21 +141,24 @@ class LatticeActorCritic(nn.Module):
                                    (self.action_dim, self.hidden_layer_dims[-1]))
         if not self.learnable_std:
             actor_mean_logtstd = jax.lax.stop_gradient(actor_mean_logtstd)
-        # get log(S_x)
-        actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
-                                   (self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
+        # get log(S_x)        
+        if self.full_latent_matrix:
+            actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
+                                       (self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
+        else:
+            actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
+                                    (self.hidden_layer_dims[-1],))
         if not self.learnable_std:
             actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
         # compute S_a^2 * x^2
         actor_mean_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * actor_mean_logtstd), jnp.square(actor_latent))
         # compute S_x^2 * x^2
-        actor_latent_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * actor_latent_logtstd), jnp.square(actor_latent))
+        actor_latent_var = jnp.exp(2.0 * actor_latent_logtstd) * jnp.square(actor_latent)
         # get W
-        final_layer_weights = self.get_variable("params", "W")["kernel"].mT
+        final_layer_weights_T = self.get_variable("params", "W")["kernel"]
         # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2)
-        covx = jnp.einsum("ah,...h,jh->...aj", final_layer_weights, actor_latent_var, final_layer_weights)
-        cova = jnp.einsum("...i,ij->...ij", actor_mean_var, jnp.eye(self.action_dim, dtype=actor_mean_var.dtype))
-        actor_covar = covx + cova
+        covx = jnp.matmul((final_layer_weights_T.mT * jnp.atleast_2d(actor_latent_var)[:, None, :]), final_layer_weights_T)
+        actor_covar = covx.at[:, range(self.action_dim), range(self.action_dim)].add(actor_mean_var)
 
         # create policy using the mean W * x and the covariance
         pi = distrax.MultivariateNormalFullCovariance(actor_mean, actor_covar)

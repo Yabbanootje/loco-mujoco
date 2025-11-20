@@ -95,7 +95,7 @@ class PPOJax(JaxRLAlgorithmBase):
                                              for i in range(config.experiment.len_obs_history)])
             critic_obs_ind = jnp.concatenate([critic_obs_ind + i*obs_len
                                               for i in range(config.experiment.len_obs_history)])
-        actorcritic_class = LatticeActorCritic if config.experiment.use_lattice is not None and config.experiment.use_lattice else ActorCritic
+        actorcritic_class = LatticeActorCritic if "use_lattice" in config.experiment and config.experiment.use_lattice else ActorCritic
         network = actorcritic_class(
             env.info.action_space.shape[0],
             activation=config.experiment.activation,
@@ -447,7 +447,7 @@ class PPOJax(JaxRLAlgorithmBase):
         train_state = agent_state.train_state
 
         if deterministic:
-            if config.experiment.use_lattice:
+            if "use_lattice" in config and config.experiment.use_lattice:
                 train_state.params["mean_log_std"] = np.ones_like(train_state.params["mean_log_std"]) * -np.inf
                 train_state.params["latent_log_std"] = np.ones_like(train_state.params["latent_log_std"]) * -np.inf
             else:
