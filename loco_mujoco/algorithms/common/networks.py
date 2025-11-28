@@ -164,10 +164,12 @@ class LatticeActorCritic(nn.Module):
         # get W
         final_layer_weights_T = self.get_variable("params", "W")["kernel"]
         # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2) + epsilon
-        covx = jnp.matmul((final_layer_weights_T.mT * jnp.atleast_2d(actor_latent_var)[:, None, :]), final_layer_weights_T)
-        actor_covar = covx.at[:, range(self.action_dim), range(self.action_dim)].add(actor_mean_var + 1e-6, 
-                                                                                     indices_are_sorted=True, 
-                                                                                     unique_indices=True)
+        def cov_single(latent_var):
+            return (final_layer_weights_T.mT * latent_var[None, :]) @ final_layer_weights_T
+        covx = jax.vmap(cov_single)(jnp.atleast_2d(actor_latent_var))
+        def add_diag(cov, diagonal):
+            return cov + jnp.diag(diagonal + 1e-6)
+        actor_covar = jax.vmap(add_diag)(covx, jnp.atleast_2d(actor_mean_var))
 
         # create policy using the mean W * x and the covariance
         pi = distrax.MultivariateNormalFullCovariance(actor_mean, actor_covar)

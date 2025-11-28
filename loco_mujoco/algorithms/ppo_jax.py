@@ -447,7 +447,7 @@ class PPOJax(JaxRLAlgorithmBase):
         train_state = agent_state.train_state
 
         if deterministic:
-            if "use_lattice" in config and config.experiment.use_lattice:
+            if "use_lattice" in config and config.use_lattice:
                 train_state.params["mean_log_std"] = np.ones_like(train_state.params["mean_log_std"]) * -np.inf
                 train_state.params["latent_log_std"] = np.ones_like(train_state.params["latent_log_std"]) * -np.inf
             else:
