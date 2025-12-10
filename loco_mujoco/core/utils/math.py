@@ -356,6 +356,9 @@ def transform_motion(vel, new_pos, old_pos, rot_mat_new2old, backend, flg_local=
 
 
 def calculate_relative_site_quatities(data, rel_site_ids, rel_body_ids, body_rootid, backend):
+    """
+    Calculate the relative positions, angles and velocities of a set of sites with respect to the main site, given by the first entry in rel_site_ids.
+    """
 
     if backend == np:
         R = np_R

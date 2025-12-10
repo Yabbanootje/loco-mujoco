@@ -163,10 +163,10 @@ class LatticeActorCritic(nn.Module):
             actor_latent_var = jnp.exp(2.0 * (actor_latent_logtstd - 0.5 * jnp.log(self.hidden_layer_dims[-1]))) * jnp.square(actor_latent)
         # get W
         final_layer_weights_T = self.get_variable("params", "W")["kernel"]
-        # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2) + epsilon
-        def cov_single(latent_var):
+        # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2) + Diag(epsilon)
+        def cov_x(latent_var):
             return (final_layer_weights_T.mT * latent_var[None, :]) @ final_layer_weights_T
-        covx = jax.vmap(cov_single)(jnp.atleast_2d(actor_latent_var))
+        covx = jax.vmap(cov_x)(jnp.atleast_2d(actor_latent_var))
         def add_diag(cov, diagonal):
             return cov + jnp.diag(diagonal + 1e-6)
         actor_covar = jax.vmap(add_diag)(covx, jnp.atleast_2d(actor_mean_var))

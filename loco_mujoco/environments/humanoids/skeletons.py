@@ -5,6 +5,7 @@ import mujoco
 from mujoco import MjSpec
 
 import loco_mujoco
+from loco_mujoco.core import ObservationType
 from loco_mujoco.environments.humanoids.base_skeleton import BaseSkeleton
 
 
@@ -660,6 +661,21 @@ class SkeletonMuscle(BaseSkeleton):
             del kwargs["use_muscles"]
 
         super(SkeletonMuscle, self).__init__(use_muscles=True, **kwargs)
+
+    @staticmethod
+    def _get_observation_specification(spec: MjSpec) -> List[ObservationType]:
+        """
+        Returns the observation specification of the environment.
+
+        Args:
+            spec (MjSpec): Specification of the environment.
+
+        Returns:
+            A list of observation types.
+        """
+        observation_spec = super(SkeletonMuscle, SkeletonMuscle)._get_observation_specification(spec)
+        observation_spec.append(ObservationType.LastAction(obs_name="last_action"))
+        return observation_spec
 
     @staticmethod
     def _get_action_specification(spec: MjSpec) -> List[str]:
