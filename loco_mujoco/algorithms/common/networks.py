@@ -107,7 +107,7 @@ class ActorCritic(nn.Module):
 
 class LatticeActorCritic(nn.Module):
     action_dim: Sequence[int]
-    activation: str = "tanh"
+    activation: str = "silu"
     output_activation: str = "tanh"
     init_std: float = 1.0
     learnable_std: bool = True
@@ -130,7 +130,7 @@ class LatticeActorCritic(nn.Module):
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
         # seperate latent from output layer
         actor_latent = LatticeLatentNet(self.hidden_layer_dims, self.activation,
-                                       "tanh", False)(actor_x)
+                                       self.activation, False)(actor_x)
         final_layer = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="W")
         actor_mean = final_layer(actor_latent)
         actor_mean = self.output_activation_fn(actor_mean)
