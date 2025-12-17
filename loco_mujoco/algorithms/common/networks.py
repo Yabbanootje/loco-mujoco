@@ -50,7 +50,7 @@ class FullyConnectedNet(nn.Module):
 class LatticeLatentNet(nn.Module):
 
     hidden_layer_dims: Sequence[int]
-    activation: str = "tanh"
+    activation: str = "silu"
     output_activation: str = None    # none means linear activation
     use_running_mean_stand: bool = True
 
