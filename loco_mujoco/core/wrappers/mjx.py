@@ -101,6 +101,14 @@ class SummaryMetrics:
     mean_episode_return: float = 0.0
     mean_episode_length: float = 0.0
     max_timestep: int = 0.0
+    var_episode_return: float = 0.0
+    var_episode_length: float = 0.0
+    min_timestep: int = 0.0
+    max_episode_return: float = 0.0
+    max_episode_length: int = 0.0
+    min_episode_return: float = 0.0
+    min_episode_length: float = 0.0
+    num_episodes: int = 0
 
 
 @struct.dataclass

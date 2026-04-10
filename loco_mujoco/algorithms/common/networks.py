@@ -121,6 +121,21 @@ class LatticeActorCritic(nn.Module):
         self.output_activation_fn = get_activation_fn(self.output_activation) \
             if self.output_activation is not None else lambda x: x
 
+    def sample_lattice_noise(self, noise, mean_log_std, latent_log_std, seed=0):
+        rng1, rng2 = jax.random.split(seed)
+
+        # scale the log stds to remove dependency of the noise on the size of the latent state
+        scaled_latent_log_std = latent_log_std - 0.5 * jnp.log(self.hidden_layer_dims[-1])
+        scaled_mean_log_std = mean_log_std - 0.5 * jnp.log(self.hidden_layer_dims[-1])
+
+        corr_std = jnp.exp(scaled_latent_log_std)
+        ind_std = jnp.exp(scaled_mean_log_std)
+
+        corr_noise = jax.random.normal(rng1, corr_std.shape) * corr_std
+        ind_noise = jax.random.normal(rng2, ind_std.shape) * ind_std
+
+        return corr_noise, ind_noise
+
     @nn.compact
     def __call__(self, x):
 
@@ -134,6 +149,12 @@ class LatticeActorCritic(nn.Module):
         final_layer = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="W")
         actor_mean = final_layer(actor_latent)
         actor_mean = self.output_activation_fn(actor_mean)
+        
+        ind_noise = self.variable(
+            "noise",
+            "ind_exploration_mat",
+            lambda: jnp.zeros((self.action_dim, self.hidden_layer_dims[-1]))
+        )
 
         # add lattice noise
         # get log(S_a)
@@ -147,9 +168,21 @@ class LatticeActorCritic(nn.Module):
         if self.full_latent_matrix:
             actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                        (self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
+            
+            corr_noise = self.variable(
+                "noise",
+                "corr_exploration_mat",
+                lambda: jnp.zeros((self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
+            )
         else:
             actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                     (self.hidden_layer_dims[-1],))
+        
+            corr_noise = self.variable(
+                "noise",
+                "corr_exploration_mat",
+                lambda: jnp.zeros(self.hidden_layer_dims[-1],)
+            )
         if not self.learnable_std:
             actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
         else:
@@ -174,10 +207,24 @@ class LatticeActorCritic(nn.Module):
         # create policy using the mean W * x and the covariance
         pi = distrax.MultivariateNormalFullCovariance(actor_mean, actor_covar)
 
+        # latent-dependent noise
+        if self.full_latent_matrix:
+            latent_noise = jnp.einsum("ij,...j->...i", corr_noise.value, actor_latent)
+        else:
+            latent_noise = actor_latent * corr_noise.value
+        action_noise = jnp.einsum("ij,...j->...i", ind_noise.value, actor_latent)
+
+        # noisy latent
+        noisy_latent = actor_latent + latent_noise
+
+        # noisy action
+        noisy_action = final_layer(noisy_latent) + action_noise
+        noisy_action = self.output_activation_fn(noisy_action)
+
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
         critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
-        return pi, jnp.squeeze(critic, axis=-1)
+        return pi, noisy_action, jnp.squeeze(critic, axis=-1)
 
 
 class RunningMeanStd(nn.Module):

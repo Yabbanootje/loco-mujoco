@@ -30,6 +30,7 @@ class MetricHandlerTransition(NamedTuple):
 
 class TrainState(train_state.TrainState):
     run_stats: Any
+    lattice_noise: Any
 
 
 @struct.dataclass

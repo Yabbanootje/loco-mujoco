@@ -12,6 +12,7 @@ from jax_tqdm import scan_tqdm
 from flax import struct
 import flax
 import optax
+import wandb
 
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic, LatticeActorCritic,
                                     Transition, TrainState, TrainStateBuffer, MetricHandlerTransition)
@@ -130,6 +131,42 @@ class PPOJax(JaxRLAlgorithmBase):
         tx = optax.apply_if_finite(tx, max_consecutive_errors=10000000)
 
         return tx
+    
+    @classmethod
+    def log_wandb(cls, metrics, step):
+        wandb_metrics = jax.tree.map(lambda x: jnp.mean(jnp.atleast_2d(x), axis=0), metrics)
+
+        wandb.log({
+            "Training Info/Mean Episode Return": wandb_metrics.mean_episode_return,
+            "Training Info/Mean Episode Length": wandb_metrics.mean_episode_length,
+            "Training Info/Max Timestep": wandb_metrics.max_timestep,
+            "Training Info/Var Episode Return": wandb_metrics.var_episode_return,
+            "Training Info/Var Episode Length": wandb_metrics.var_episode_length,
+            "Training Info/Min Timestep": wandb_metrics.min_timestep,
+            "Training Info/Max Episode Return": wandb_metrics.max_episode_return,
+            "Training Info/Max Episode Length": wandb_metrics.max_episode_length,
+            "Training Info/Min Episode Return": wandb_metrics.min_episode_return,
+            "Training Info/Min Episode Length": wandb_metrics.min_episode_length,
+            "Training Info/Num Episodes": wandb_metrics.num_episodes
+        }, step=step)
+
+    @classmethod
+    def log_val_wandb(cls, metrics, step):
+        wandb_metrics = jax.tree.map(lambda x: jnp.mean(jnp.atleast_2d(x), axis=0), metrics)
+
+        wandb.log({
+            "Validation Info/Mean Episode Return": wandb_metrics.mean_episode_return,
+            "Validation Info/Mean Episode Length": wandb_metrics.mean_episode_length,
+            "Validation Info/Max Timestep": wandb_metrics.max_timestep,
+            "Validation Info/Var Episode Return": wandb_metrics.var_episode_return,
+            "Validation Info/Var Episode Length": wandb_metrics.var_episode_length,
+            "Validation Info/Min Timestep": wandb_metrics.min_timestep,
+            "Validation Info/Max Episode Return": wandb_metrics.max_episode_return,
+            "Validation Info/Max Episode Length": wandb_metrics.max_episode_length,
+            "Validation Info/Min Episode Return": wandb_metrics.min_episode_return,
+            "Validation Info/Min Episode Length": wandb_metrics.min_episode_length,
+            "Validation Info/Num Episodes": wandb_metrics.num_episodes            
+        }, step=step)
 
     @classmethod
     def _train_fn(cls, rng, env,
@@ -163,6 +200,7 @@ class PPOJax(JaxRLAlgorithmBase):
             apply_fn=network.apply,
             params=network_params["params"] if train_state is None else train_state.params,
             run_stats=network_params["run_stats"] if train_state is None else train_state.run_stats,
+            lattice_noise=network_params["noise"] if (train_state is None and config.use_lattice) else (None if train_state is None else train_state.lattice_noise),
             tx=tx,
         )
 
@@ -177,18 +215,39 @@ class PPOJax(JaxRLAlgorithmBase):
         @scan_tqdm(config.num_updates, print_rate=1, desc='PPO JAX Training')
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state, step):
                 train_state, env_state, last_obs, train_state_buffer, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                y, updates = network.apply({'params': train_state.params,
-                                                  'run_stats': train_state.run_stats},
-                                                 last_obs, mutable=["run_stats"])
-                pi, value = y
+                state = {'params': train_state.params, 'run_stats': train_state.run_stats}
+                if config.use_lattice:
+                    state['noise'] = train_state.lattice_noise
+                y, updates = network.apply(state, last_obs, mutable=["run_stats", "noise"] if config.use_lattice else ["run_stats"])
+                if config.use_lattice:
+                    pi, action, value = y
+                    def update_train_state(train_state):
+                        corr_noise, ind_noise = network.sample_lattice_noise(noise=train_state.lattice_noise, 
+                                                                            mean_log_std=train_state.params["mean_log_std"], 
+                                                                            latent_log_std=train_state.params["latent_log_std"], 
+                                                                            seed=_rng)
+                        
+                        old_noise = train_state.lattice_noise
+                        new_noise = {
+                            **old_noise,
+                            "corr_exploration_mat": corr_noise,
+                            "ind_exploration_mat": ind_noise,
+                        }
+                        return train_state.replace(lattice_noise=new_noise)
+                    
+                    train_state = jax.lax.cond(step % config.lattice_sample_freq == 0,
+                                                lambda: update_train_state(train_state),
+                                                lambda: train_state)
+                else:
+                    pi, value = y
+                    action = pi.sample(seed=_rng)
                 train_state = train_state.replace(run_stats=updates['run_stats'])   # update stats
-                action = pi.sample(seed=_rng)
-                if config.experiment.debug:
+                if config.debug:
                     jax.debug.print("action: {s} {x}", s=action.shape, x=action)
                 log_prob = pi.log_prob(action)
 
@@ -207,15 +266,17 @@ class PPOJax(JaxRLAlgorithmBase):
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config.num_steps
+                _env_step, runner_state, jnp.arange(config.num_steps), config.num_steps
             )
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, train_state_buffer, rng = runner_state
-            y, _ = network.apply({'params': train_state.params,
-                                              'run_stats': train_state.run_stats},
-                                             last_obs, mutable=["run_stats"])
-            pi, last_val = y
+            state = {'params': train_state.params, 'run_stats': train_state.run_stats}
+            if config.use_lattice:
+                state['noise'] = train_state.lattice_noise
+            y, _ = network.apply(state,
+                                    last_obs, mutable=["run_stats", "noise"] if config.use_lattice else ["run_stats"])
+            *pi, last_val = y
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -253,9 +314,13 @@ class PPOJax(JaxRLAlgorithmBase):
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        y, _ = network.apply({'params': params, 'run_stats': train_state.run_stats},
-                                             traj_batch.obs, mutable=["run_stats"])
-                        pi, value = y
+                        state = {'params': params, 'run_stats': train_state.run_stats}
+                        if config.use_lattice:
+                            state['noise'] = train_state.lattice_noise
+                        y, _ = network.apply(state,
+                                                traj_batch.obs, mutable=["run_stats", "noise"] if config.use_lattice else ["run_stats"])
+                        *pi, value = y
+                        pi = pi[0]
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS
@@ -282,7 +347,7 @@ class PPOJax(JaxRLAlgorithmBase):
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
+                        entropy = pi[0].entropy().mean()
 
                         total_loss = (
                             loss_actor
@@ -335,11 +400,24 @@ class PPOJax(JaxRLAlgorithmBase):
 
             logged_metrics = traj_batch.metrics
 
+            mean_episode_return = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)) / jnp.sum(logged_metrics.done)
+            mean_episode_length = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done)
+
             metric = SummaryMetrics(
-                mean_episode_return=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)) / jnp.sum(logged_metrics.done),
-                mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
+                mean_episode_return=mean_episode_return,
+                mean_episode_length=mean_episode_length,
                 max_timestep=jnp.max(logged_metrics.timestep * config.num_envs),
+                var_episode_return=jnp.sum(jnp.square(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns - mean_episode_return, 0.0))) / jnp.sum(logged_metrics.done),
+                var_episode_length=jnp.sum(jnp.square(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths - mean_episode_length, 0.0))) / jnp.sum(logged_metrics.done),
+                min_timestep=jnp.min(logged_metrics.timestep * config.num_envs),
+                max_episode_return=jnp.max(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)),
+                max_episode_length=jnp.max(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)),
+                min_episode_return=jnp.min(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 9999.9)),
+                min_episode_length=jnp.min(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 9999.9)),
+                num_episodes=jnp.sum(logged_metrics.done)
             )
+
+            jax.debug.callback(cls.log_wandb, metric, config.num_steps * config.num_envs * counter)
 
             def _evaluation_step():
 
@@ -348,12 +426,14 @@ class PPOJax(JaxRLAlgorithmBase):
 
                     # SELECT ACTION
                     rng, _rng = jax.random.split(rng)
-                    y, updates = train_state.apply_fn({'params': train_state.params,
-                                                       'run_stats': train_state.run_stats},
-                                                      last_obs, mutable=["run_stats"])
-                    pi, value = y
+                    state = {'params': train_state.params, 'run_stats': train_state.run_stats}
+                    if config.use_lattice:
+                        state['noise'] = train_state.lattice_noise
+                    y, updates = train_state.apply_fn(state,
+                                                        last_obs, mutable=["run_stats", "noise"] if config.use_lattice else ["run_stats"])
+                    *pi, value = y
                     train_state = train_state.replace(run_stats=updates['run_stats'])  # update stats
-                    action = pi.sample(seed=_rng)
+                    action = pi[0].mean()
 
                     # STEP ENV
                     obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
@@ -380,6 +460,8 @@ class PPOJax(JaxRLAlgorithmBase):
                 env_states = traj_batch_eval.env_state
 
                 validation_metrics = mh(env_states)
+
+                jax.debug.callback(cls.log_val_wandb, validation_metrics, config.num_steps * config.num_envs * counter)
 
                 return validation_metrics
 
@@ -435,23 +517,33 @@ class PPOJax(JaxRLAlgorithmBase):
             assert n_envs == 1, "Only one mujoco env can be run at a time."
 
         def sample_actions(ts, obs, _rng):
-            y, updates = agent_conf.network.apply({'params': ts.params,
-                                                   'run_stats': ts.run_stats},
-                                                  obs, mutable=["run_stats"])
-            ts = ts.replace(run_stats=updates['run_stats'])  # update stats
-            pi, _ = y
-            a = pi.sample(seed=_rng)
+            if config.use_lattice:
+                y, updates = agent_conf.network.apply({'params': ts.params,
+                                                    'run_stats': ts.run_stats,
+                                                    'noise': ts.lattice_noise},
+                                                        obs, mutable=["run_stats", "noise"])
+                ts = ts.replace(run_stats=updates['run_stats'])  # update stats
+                *pi, _ = y
+                a = pi[0].mean() if deterministic else (pi[1] if config.use_lattice else pi[0].sample(seed=_rng))
+            else: 
+                y, updates = agent_conf.network.apply({'params': ts.params,
+                                                        'run_stats': ts.run_stats},
+                                                        obs, mutable=["run_stats"])
+                ts = ts.replace(run_stats=updates['run_stats'])  # update stats
+                pi, _ = y
+                a = pi.mean() if deterministic else pi.sample(seed=_rng)
+                
             return a, ts
 
         config = agent_conf.config.experiment
         train_state = agent_state.train_state
 
-        if deterministic:
-            if "use_lattice" in config and config.use_lattice:
-                train_state.params["mean_log_std"] = np.ones_like(train_state.params["mean_log_std"]) * -np.inf
-                train_state.params["latent_log_std"] = np.ones_like(train_state.params["latent_log_std"]) * -np.inf
-            else:
-                train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
+        # if deterministic:
+        #     if "use_lattice" in config and config.use_lattice:
+        #         train_state.params["mean_log_std"] = np.ones_like(train_state.params["mean_log_std"]) * -np.inf
+        #         train_state.params["latent_log_std"] = np.ones_like(train_state.params["latent_log_std"]) * -np.inf
+        #     else:
+        #         train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
         if config.n_seeds > 1:
             assert train_state_seed is not None, ("Loaded train state has multiple seeds. Please specify "

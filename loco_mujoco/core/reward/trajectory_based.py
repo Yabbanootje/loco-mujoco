@@ -173,15 +173,17 @@ class MimicReward(TrajectoryBasedReward):
         # reward coefficients
         self._qpos_w_exp = kwargs.get("qpos_w_exp", 10.0)
         self._qvel_w_exp = kwargs.get("qvel_w_exp", 2.0)
+        self._com_w_exp = kwargs.get("com_w_exp", 50.0)
         self._rpos_w_exp = kwargs.get("rpos_w_exp", 100.0)
         self._rquat_w_exp = kwargs.get("rquat_w_exp", 10.0)
         self._rvel_w_exp = kwargs.get("rvel_w_exp", 0.1)
         self._qpos_w_sum = kwargs.get("qpos_w_sum", 0.0)
         self._qvel_w_sum = kwargs.get("qvel_w_sum", 0.0)
+        self._com_w_sum = kwargs.get("com_w_sum", 0.0)
         self._rpos_w_sum = kwargs.get("rpos_w_sum", 0.5)
         self._rquat_w_sum = kwargs.get("rquat_w_sum", 0.3)
         self._rvel_w_sum = kwargs.get("rvel_w_sum", 0.0)
-        self._action_out_of_bounds_coeff = kwargs.get("action_out_of_bounds_coeff", 0.01)
+        self._action_out_of_bounds_coeff = kwargs.get("action_out_of_bounds_coeff", 0.0)
         self._joint_acc_coeff = kwargs.get("joint_acc_coeff", 0.0)
         self._joint_torque_coeff = kwargs.get("joint_torque_coeff", 0.0)
         self._action_rate_coeff = kwargs.get("action_rate_coeff", 0.0)
@@ -198,6 +200,8 @@ class MimicReward(TrajectoryBasedReward):
 
         # determine qpos and qvel indices
         quat_in_qpos = []
+        xy_in_qpos = []
+        xyz_in_qpos = []
         qpos_ind = []
         qvel_ind = []
         for i in range(model.njnt):
@@ -208,11 +212,17 @@ class MimicReward(TrajectoryBasedReward):
                 qpos_ind.append(qposid)
                 qvel_ind.append(qvelid)
                 if model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE:
+                    xy_in_qpos.append(qposid[:2])
+                    xyz_in_qpos.append(qposid[:3])
                     quat_in_qpos.append(qposid[3:])
         self._qpos_ind = np.concatenate(qpos_ind)
         self._qvel_ind = np.concatenate(qvel_ind)
         quat_in_qpos = np.concatenate(quat_in_qpos)
         self._quat_in_qpos = np.array([True if q in quat_in_qpos else False for q in self._qpos_ind])
+        xy_in_qpos = np.concatenate(xy_in_qpos)
+        self._xy_in_qpos = np.array([True if q in xy_in_qpos else False for q in self._qpos_ind])
+        xyz_in_qpos = np.concatenate(xyz_in_qpos)
+        self._xyz_in_qpos = np.array([True if q in xyz_in_qpos else False for q in self._qpos_ind])
 
         # calc mask for the root free joint velocities
         self._free_joint_qvel_ind = np.array(mj_jntname2qvelid(self._info_props["root_free_joint_xml_name"], model))
@@ -325,9 +335,12 @@ class MimicReward(TrajectoryBasedReward):
                                                 model.body_rootid, backend))
 
         # calculate distances
-        qpos_dist = backend.mean(backend.square(qpos[~self._quat_in_qpos] - qpos_traj[~self._quat_in_qpos]))
+        qpos_dist = backend.mean(backend.square(qpos[~(self._quat_in_qpos + self._xy_in_qpos)] - qpos_traj[~(self._quat_in_qpos + self._xy_in_qpos)]))
         qpos_dist += backend.mean(quaternion_angular_distance(qpos_quat, qpos_quat_traj, backend))
         qvel_dist = backend.mean(backend.square(qvel - qvel_traj))
+        traj_data_first = traj_data.get(carry.traj_state.traj_no, carry.traj_state.subtraj_step_no_init, backend)
+        qpos_offset = backend.append(traj_data_first.qpos[self._xy_in_qpos], 0.0) # needed to get absolute position of current data, as in qpos_traj
+        com_dist = backend.mean(backend.square(qpos_offset + qpos[self._xyz_in_qpos] - qpos_traj[self._xyz_in_qpos]))
         if len(self._rel_site_ids) > 1:
             rpos_dist = backend.mean(backend.square(site_rpos - site_rpos_traj))
             rangles_dist = backend.mean(backend.square(site_rangles - site_rangles_traj))
@@ -337,6 +350,7 @@ class MimicReward(TrajectoryBasedReward):
         # calculate rewards
         qpos_reward = backend.exp(-self._qpos_w_exp*qpos_dist)
         qvel_reward = backend.exp(-self._qvel_w_exp*qvel_dist)
+        com_reward = backend.exp(-self._com_w_exp*com_dist)
         if len(self._rel_site_ids) > 1:
             rpos_reward = backend.exp(-self._rpos_w_exp*rpos_dist)
             rangles_reward = backend.exp(-self._rquat_w_exp*rangles_dist)
@@ -356,28 +370,28 @@ class MimicReward(TrajectoryBasedReward):
             last_joint_vel = reward_state.last_qvel[~self._free_joint_qvel_mask]
             joint_vel = data.qvel[~self._free_joint_qvel_mask]
             acceleration_norm = backend.sum(backend.square(joint_vel - last_joint_vel) / env.dt)
-            acceleration_reward = self._joint_acc_coeff * -acceleration_norm
+            acceleration_reward =  -acceleration_norm
         else:
             acceleration_reward = 0.0
 
         # joint torque reward
         if self._joint_torque_coeff > 0.0:
             torque_norm = backend.sum(backend.square(data.qfrc_actuator[~self._free_joint_qvel_mask]))
-            torque_reward = self._joint_torque_coeff * -torque_norm
+            torque_reward = -torque_norm
         else:
             torque_reward = 0.0
 
         # action rate reward
         if self._action_rate_coeff > 0.0:
             action_rate_norm = backend.sum(backend.square(action - reward_state.last_action))
-            action_rate_reward = self._action_rate_coeff * -action_rate_norm
+            action_rate_reward = -action_rate_norm
         else:
             action_rate_reward = 0.0
 
         # action size reward
-        if self._action_rate_coeff > 0.0:
+        if self._action_size_coeff > 0.0:
             action_size_norm = backend.sum(backend.square(action))
-            action_size_reward = self._action_size_coeff * -action_size_norm    
+            action_size_reward = -action_size_norm 
         else:
             action_size_reward = 0.0
 
@@ -390,7 +404,7 @@ class MimicReward(TrajectoryBasedReward):
                             )
 
         # calculate total reward
-        total_reward = (self._qpos_w_sum * qpos_reward + self._qvel_w_sum * qvel_reward)
+        total_reward = (self._qpos_w_sum * qpos_reward + self._qvel_w_sum * qvel_reward + self._com_w_sum * com_reward)
         if len(self._rel_site_ids) > 1:
             total_reward = (total_reward
                         + self._rpos_w_sum * rpos_reward + self._rquat_w_sum * rangles_reward
