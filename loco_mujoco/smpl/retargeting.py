@@ -99,7 +99,7 @@ def load_amass_data(data_path: str) -> dict:
         dict: Parsed AMASS data including poses, translations, and other attributes.
 
     """
-    path_to_amass_datasets = get_amass_dataset_path()
+    path_to_amass_datasets = get_amass_dataset_path().replace("\\", "/")
 
     # get paths to all amass files
     path_to_all_amass_files = os.path.join(path_to_amass_datasets, "**/*.npz")
@@ -107,7 +107,7 @@ def load_amass_data(data_path: str) -> dict:
 
     # get full dataset path
     key_names = [
-        "/".join(data_path.replace(path_to_amass_datasets + "/", "").split("/")).replace(".npz", "")
+        "/".join(data_path.replace("\\", "/").replace(path_to_amass_datasets + "/", "").split("/")).replace(".npz", "")
         for data_path in all_pkls]
     if data_path.startswith("/"):
         data_path = data_path[1:]
@@ -346,6 +346,27 @@ def fit_smpl_motion(
     return Trajectory(traj_info, traj_data)
 
 
+def wrap_qpos_into_joint_limits(qpos, model):
+    """
+    Wraps hinge joints to be within [-np.pi, np.pi]. This avoids problems that arise from disabling joint limits,
+    as this can result in values that are technically correct, but clash with the interpretation of MuJoCo.
+    """
+    qpos_wrapped = qpos.copy()
+    for j in range(model.njnt):
+        if model.jnt_type[j] != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        lower, upper = model.jnt_range[j]
+
+        qpos_wrapped[j] = np.arctan2(np.sin(qpos[j]), np.cos(qpos[j]))
+        if qpos_wrapped[j] < lower:
+            qpos_wrapped[j] = lower
+        if qpos_wrapped[j] > upper:
+            qpos_wrapped[j] = upper
+
+        print(f"mapping {model.joint(j).name} from {qpos[j]} to be within [{lower}, {upper}], resulting in {qpos_wrapped[j]}")
+    return qpos_wrapped
+
+
 def get_init_qpos_for_motion_retargeting(env, init_mocap_pos, init_mocap_quat, robot_conf):
     """
     Get the initial qpos for motion retargeting by temporarily disabling joint limits and collisions and
@@ -380,13 +401,14 @@ def get_init_qpos_for_motion_retargeting(env, init_mocap_pos, init_mocap_quat, r
     env._data.mocap_quat = init_mocap_quat
     mujoco.mj_step(env._model, env._data, robot_conf.optimization_params.init_motion_iterations)
     qpos = env._data.qpos.copy()
+    qpos_wrapped = wrap_qpos_into_joint_limits(qpos, env._model)
 
     # load old model to env
     env.reload_mujoco(old_mjspec)
     key = jax.random.key(0)
     env.reset(key)
 
-    return qpos
+    return qpos_wrapped
 
 
 def fit_smpl_shape(

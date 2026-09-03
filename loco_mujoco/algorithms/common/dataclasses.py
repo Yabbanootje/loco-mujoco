@@ -21,6 +21,8 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     traj_state: TrajState
     metrics: Metrics
+    cvae_obs_x: jnp.ndarray
+    cvae_obs_cond: jnp.ndarray
 
 
 class MetricHandlerTransition(NamedTuple):
@@ -30,7 +32,6 @@ class MetricHandlerTransition(NamedTuple):
 
 class TrainState(train_state.TrainState):
     run_stats: Any
-    lattice_noise: Any
 
 
 @struct.dataclass

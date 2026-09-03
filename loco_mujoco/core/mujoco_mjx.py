@@ -1,4 +1,4 @@
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Union, Optional
 from types import ModuleType
 
 import mujoco

@@ -1,6 +1,7 @@
 from omegaconf import OmegaConf, DictConfig
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 from flax import struct
 from jax.scipy.spatial.transform import Rotation as R
@@ -16,7 +17,7 @@ SUPPORTED_QUANTITIES = ["JointPosition", "JointVelocity", "BodyPosition", "BodyV
                         "SitePosition", "SiteVelocity",
                         "SiteOrientation", "RelSitePosition", "RelSiteVelocity", "RelSiteOrientation"]
 
-SUPPORTED_MEASURES = ["EuclideanDistance", "DynamicTimeWarping", "DiscreteFrechetDistance"]
+SUPPORTED_MEASURES = ["EuclideanDistance", "DynamicTimeWarping", "DiscreteFrechetDistance", "CosineDistance"]
 
 
 @struct.dataclass
@@ -36,9 +37,10 @@ class QuantityContainer:
 
 @struct.dataclass
 class ValidationSummary(SummaryMetrics):
-    euclidean_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
-    dynamic_time_warping: QuantityContainer = struct.field(default_factory=QuantityContainer)
-    discrete_frechet_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
+    # euclidean_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
+    # dynamic_time_warping: QuantityContainer = struct.field(default_factory=QuantityContainer)
+    # discrete_frechet_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
+    cosine_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
 
 
 class MetricsHandler:
@@ -101,15 +103,18 @@ class MetricsHandler:
                 assert m in SUPPORTED_MEASURES, f"{m} is not a supported measure."
 
             dummy_func = lambda x, y: 0.0
-            self._euclidean_distance = jax.vmap(jax.vmap(DistanceMeasures.create_instance("EuclideanDistance", mean=True),
-                                                in_axes=(0, 0)), in_axes=(0, 0)) \
-                if "EuclideanDistance" in self.measures else dummy_func
-            self._dynamic_time_warping = jax.vmap(jax.vmap(DistanceMeasures.create_instance("DynamicTimeWarping"),
-                                                  in_axes=(0, 0)), in_axes=(0, 0)) \
-                if "DynamicTimeWarping" in self.measures else dummy_func
-            self._discrete_frechet_distance = jax.vmap(jax.vmap(DistanceMeasures.create_instance("DiscreteFrechetDistance"),
+            # self._euclidean_distance = jax.vmap(jax.vmap(DistanceMeasures.create_instance("EuclideanDistance", mean=True),
+            #                                     in_axes=(0, 0)), in_axes=(0, 0)) \
+            #     if "EuclideanDistance" in self.measures else dummy_func
+            # self._dynamic_time_warping = jax.vmap(jax.vmap(DistanceMeasures.create_instance("DynamicTimeWarping"),
+            #                                       in_axes=(0, 0)), in_axes=(0, 0)) \
+            #     if "DynamicTimeWarping" in self.measures else dummy_func
+            # self._discrete_frechet_distance = jax.vmap(jax.vmap(DistanceMeasures.create_instance("DiscreteFrechetDistance"),
+            #                                            in_axes=(0, 0)), in_axes=(0, 0))\
+            #     if "DiscreteFrechetDistance" in self.measures else dummy_func
+            self._cosine_distance = jax.vmap(jax.vmap(DistanceMeasures.create_instance("CosineDistance"),
                                                        in_axes=(0, 0)), in_axes=(0, 0))\
-                if "DiscreteFrechetDistance" in self.measures else dummy_func
+                if "CosineDistance" in self.measures else dummy_func
 
         if self.quantaties is not None:
             for q in self.quantaties:
@@ -119,6 +124,8 @@ class MetricsHandler:
                     assert self.rel_site_ids is not None, ("Relative site quantities requires relative site ids with "
                                                            "the first site being the site used to calculate the "
                                                            "relative quantities.")
+        else:
+            self.quantaties = []
 
         self._vec_calc_site_velocities = jax.vmap(jax.vmap(calc_site_velocities, in_axes=(None, 0, None, None, None, None)), in_axes=(None, 0, None, None, None, None))
         self._vec_calc_rel_site_quantities = jax.vmap(jax.vmap(calculate_relative_site_quatities, in_axes=(0, None, None, None, None)), in_axes=(0, None, None, None, None))
@@ -141,6 +148,9 @@ class MetricsHandler:
             logged_metrics.done)
         mean_episode_length = jnp.sum(
             jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(
+            logged_metrics.done)
+        mean_episode_action_size = jnp.sum(
+            jnp.where(logged_metrics.done, logged_metrics.returned_episode_action_sizes, 0.0)) / jnp.sum(
             logged_metrics.done)
         max_timestep = jnp.max(logged_metrics.timestep * self._config.num_envs)
 
@@ -210,10 +220,28 @@ class MetricsHandler:
         return ValidationSummary(
             mean_episode_return=mean_episode_return,
             mean_episode_length=mean_episode_length,
+            mean_episode_action_size=mean_episode_action_size,
             max_timestep=max_timestep,
-            euclidean_distance=jax.tree.map(lambda x, y: jnp.mean(self._euclidean_distance(x, y)) if x.size > 0 else x, container, container_traj),
-            dynamic_time_warping=jax.tree.map(lambda x, y: jnp.mean(self._dynamic_time_warping(x, y)) if x.size > 0 else x, container, container_traj),
-            discrete_frechet_distance=jax.tree.map(lambda x, y: jnp.mean(self._discrete_frechet_distance(x, y)) if x.size > 0 else x, container, container_traj))
+            var_episode_return=jnp.sum(jnp.square(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns - mean_episode_return, 0.0))) / jnp.sum(logged_metrics.done),
+            var_episode_length=jnp.sum(jnp.square(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths - mean_episode_length, 0.0))) / jnp.sum(logged_metrics.done),
+            # min_timestep=jnp.min(logged_metrics.timestep * self._config.num_envs),
+            max_episode_return=jnp.max(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)),
+            max_episode_length=jnp.max(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)),
+            min_episode_return=jnp.min(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 9999.9)),
+            min_episode_length=jnp.min(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 9999.9)),
+            num_episodes=jnp.sum(logged_metrics.done),
+            # absorbing_episodes=jnp.sum(logged_metrics.absorbing),
+            success_rate = lax.cond(
+                jnp.sum(logged_metrics.done) > 0,
+                lambda _: 1.0 - (jnp.sum(logged_metrics.absorbing) / jnp.sum(logged_metrics.done)),
+                lambda _: 0.0,
+                operand=None
+            ),
+            # euclidean_distance=jax.tree.map(lambda x, y: jnp.mean(self._euclidean_distance(x, y)) if x.size > 0 else x, container, container_traj),
+            # dynamic_time_warping=jax.tree.map(lambda x, y: jnp.mean(self._dynamic_time_warping(x, y)) if x.size > 0 else x, container, container_traj),
+            # discrete_frechet_distance=jax.tree.map(lambda x, y: jnp.mean(self._discrete_frechet_distance(x, y)) if x.size > 0 else x, container, container_traj),
+            cosine_distance = jax.tree.map(lambda x, y: (jnp.mean(jax.vmap(self._cosine_distance)(x, y)) if x.size > 0 else x), container, container_traj),
+        )
 
     def get_joint_positions(self, env_states):
         # get from data
@@ -354,5 +382,17 @@ class MetricsHandler:
                                       site_rvel=_zeros_if_exists("RelSiteVelocity"))
 
         return ValidationSummary(mean_episode_return=jnp.array(0.0), mean_episode_length=jnp.array(0.0),
-                                 max_timestep=jnp.array(0), euclidean_distance=container,
-                                 dynamic_time_warping=container, discrete_frechet_distance=container)
+                                 mean_episode_action_size=jnp.array(0.0),
+                                 max_timestep=jnp.array(0), 
+                                 var_episode_return=jnp.array(0.0),
+                                 var_episode_length=jnp.array(0.0), 
+                                #  min_timestep=jnp.array(0),
+                                 max_episode_return=jnp.array(0.0), max_episode_length=jnp.array(0.0),
+                                 min_episode_return=jnp.array(0.0), min_episode_length=jnp.array(0.0),
+                                 num_episodes=jnp.array(0), 
+                                #  absorbing_episodes=jnp.array(0), 
+                                 success_rate=jnp.array(0.0),
+                                #  euclidean_distance=container, dynamic_time_warping=container,
+                                #  discrete_frechet_distance=container, 
+                                 cosine_distance=container
+                                 )

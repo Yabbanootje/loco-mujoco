@@ -5,6 +5,12 @@ import numpy as np
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence
 import distrax
+from jax import random
+
+from loco_mujoco.core.utils.math import (
+    calculate_relative_site_quatities,
+    quaternion_relative_rotation,
+)
 
 
 def get_activation_fn(name: str):
@@ -121,20 +127,11 @@ class LatticeActorCritic(nn.Module):
         self.output_activation_fn = get_activation_fn(self.output_activation) \
             if self.output_activation is not None else lambda x: x
 
-    def sample_lattice_noise(self, noise, mean_log_std, latent_log_std, seed=0):
-        rng1, rng2 = jax.random.split(seed)
-
+    def scale_std(self, log_std):
         # scale the log stds to remove dependency of the noise on the size of the latent state
-        scaled_latent_log_std = latent_log_std - 0.5 * jnp.log(self.hidden_layer_dims[-1])
-        scaled_mean_log_std = mean_log_std - 0.5 * jnp.log(self.hidden_layer_dims[-1])
-
-        corr_std = jnp.exp(scaled_latent_log_std)
-        ind_std = jnp.exp(scaled_mean_log_std)
-
-        corr_noise = jax.random.normal(rng1, corr_std.shape) * corr_std
-        ind_noise = jax.random.normal(rng2, ind_std.shape) * ind_std
-
-        return corr_noise, ind_noise
+        log_std = log_std - 0.5 * jnp.log(self.hidden_layer_dims[-1])
+        scaled_std = jnp.exp(log_std)
+        return scaled_std
 
     @nn.compact
     def __call__(self, x):
@@ -146,15 +143,10 @@ class LatticeActorCritic(nn.Module):
         # seperate latent from output layer
         actor_latent = LatticeLatentNet(self.hidden_layer_dims, self.activation,
                                        self.activation, False)(actor_x)
+        actor_latent_detached = jax.lax.stop_gradient(actor_latent)
         final_layer = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="W")
         actor_mean = final_layer(actor_latent)
         actor_mean = self.output_activation_fn(actor_mean)
-        
-        ind_noise = self.variable(
-            "noise",
-            "ind_exploration_mat",
-            lambda: jnp.zeros((self.action_dim, self.hidden_layer_dims[-1]))
-        )
 
         # add lattice noise
         # get log(S_a)
@@ -163,37 +155,27 @@ class LatticeActorCritic(nn.Module):
         if not self.learnable_std:
             actor_mean_logtstd = jax.lax.stop_gradient(actor_mean_logtstd)
         else:
-            actor_mean_logtstd = jnp.clip(actor_mean_logtstd, a_min=1.0e-3, a_max=1.0)
+            actor_mean_logtstd = jnp.clip(actor_mean_logtstd, a_min=jnp.log(1.0e-3), a_max=jnp.log(1.0))
         # get log(S_x)
         if self.full_latent_matrix:
             actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                        (self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
-            
-            corr_noise = self.variable(
-                "noise",
-                "corr_exploration_mat",
-                lambda: jnp.zeros((self.hidden_layer_dims[-1], self.hidden_layer_dims[-1]))
-            )
         else:
             actor_latent_logtstd = self.param("latent_log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                     (self.hidden_layer_dims[-1],))
-        
-            corr_noise = self.variable(
-                "noise",
-                "corr_exploration_mat",
-                lambda: jnp.zeros(self.hidden_layer_dims[-1],)
-            )
         if not self.learnable_std:
             actor_latent_logtstd = jax.lax.stop_gradient(actor_latent_logtstd)
         else:
-            actor_latent_logtstd = jnp.clip(actor_latent_logtstd, a_min=1.0e-3, a_max=1.0)
+            actor_latent_logtstd = jnp.clip(actor_latent_logtstd, a_min=jnp.log(1.0e-3), a_max=jnp.log(1.0))
         # compute S_a^2 * x^2
-        actor_mean_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * (actor_mean_logtstd - 0.5 * jnp.log(self.hidden_layer_dims[-1]))), jnp.square(actor_latent))
+        actor_latent_detached_norm = actor_latent_detached
+        actor_latent_detached_norm = actor_latent_detached_norm / (jnp.sqrt(jnp.mean(actor_latent_detached_norm**2, axis=-1, keepdims=True)) + 1e-6)
+        actor_mean_var = jnp.einsum("ah,...h->...a", jnp.square(self.scale_std(actor_mean_logtstd)), jnp.square(actor_latent_detached_norm))
         # compute S_x^2 * x^2
         if self.full_latent_matrix:
-            actor_latent_var = jnp.einsum("ah,...h->...a", jnp.exp(2.0 * (actor_latent_logtstd - 0.5 * jnp.log(self.hidden_layer_dims[-1]))), jnp.square(actor_latent))
+            actor_latent_var = jnp.einsum("ah,...h->...a", jnp.square(self.scale_std(actor_latent_logtstd)), jnp.square(actor_latent_detached_norm))
         else:
-            actor_latent_var = jnp.exp(2.0 * (actor_latent_logtstd - 0.5 * jnp.log(self.hidden_layer_dims[-1]))) * jnp.square(actor_latent)
+            actor_latent_var = jnp.square(self.scale_std(actor_latent_logtstd)) * jnp.square(actor_latent_detached_norm)
         # get W
         final_layer_weights_T = self.get_variable("params", "W")["kernel"]
         # compute total covariance (W * Diag(S_x^2 * x^2) * W^T) + Diag(S_a^2 * x^2) + Diag(epsilon)
@@ -207,25 +189,181 @@ class LatticeActorCritic(nn.Module):
         # create policy using the mean W * x and the covariance
         pi = distrax.MultivariateNormalFullCovariance(actor_mean, actor_covar)
 
-        # latent-dependent noise
-        if self.full_latent_matrix:
-            latent_noise = jnp.einsum("ij,...j->...i", corr_noise.value, actor_latent)
-        else:
-            latent_noise = actor_latent * corr_noise.value
-        action_noise = jnp.einsum("ij,...j->...i", ind_noise.value, actor_latent)
-
-        # noisy latent
-        noisy_latent = actor_latent + latent_noise
-
-        # noisy action
-        noisy_action = final_layer(noisy_latent) + action_noise
-        noisy_action = self.output_activation_fn(noisy_action)
-
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
         critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
-        return pi, noisy_action, jnp.squeeze(critic, axis=-1)
+        return pi, jnp.squeeze(critic, axis=-1)
+    
+class Encoder(nn.Module):
+    """VAE Encoder.
+    Code adopted from J. Heek et al., Flax: A neural network library and ecosystem for JAX. 2024."""
 
+    latent_dim: int = 20
+    hidden_layer_dims: Sequence[int] = (1024, 512)
+    activation: str = "silu"
+
+    @nn.compact
+    def __call__(self, x):
+        x = LatticeLatentNet(self.hidden_layer_dims, self.activation, self.activation, False)(x)
+        mean_x = nn.Dense(self.latent_dim, name='fc2_mean')(x)
+        logvar_x = nn.Dense(self.latent_dim, name='fc2_logvar')(x)
+        return mean_x, logvar_x
+
+
+class Decoder(nn.Module):
+    """VAE Decoder.
+    Code adopted from J. Heek et al., Flax: A neural network library and ecosystem for JAX. 2024."""
+
+    output_dim: Sequence[int]
+    hidden_layer_dims: Sequence[int] = (512, 1024)
+    activation: str = "silu"
+
+    @nn.compact
+    def __call__(self, z):
+        z = LatticeLatentNet(self.hidden_layer_dims, self.activation, self.activation, False)(z)
+        z = nn.Dense(self.output_dim, name='fc2')(z)
+        return z
+
+
+class VAE(nn.Module):
+    """Full VAE model.
+    Code adopted from J. Heek et al., Flax: A neural network library and ecosystem for JAX. 2024."""
+    output_dim: Sequence[int]
+    latent_dim: int = 20
+    hidden_layer_dims_enc: Sequence[int] = (1024, 512)
+    hidden_layer_dims_dec: Sequence[int] = (512, 1024)
+    activation: str = "silu"
+
+    def setup(self):
+        self.encoder = Encoder(latent_dim=self.latent_dim, hidden_layer_dims=self.hidden_layer_dims_enc, activation=self.activation)
+        self.decoder = Decoder(output_dim=self.output_dim, hidden_layer_dims=self.hidden_layer_dims_dec, activation=self.activation)
+
+    def reparameterize(self, rng, mean, logvar):
+        std = jnp.exp(0.5 * logvar)
+        eps = random.normal(rng, logvar.shape)
+        return mean + eps * std
+
+    def __call__(self, x, z_rng):
+        mean, logvar = self.encoder(x)
+        z = self.reparameterize(z_rng, mean, logvar)
+        recon_x = self.decoder(z)
+        return recon_x, mean, logvar
+
+    def encode(self, x, z_rng):
+        mean, logvar = self.encoder(x)
+        z = self.reparameterize(z_rng, mean, logvar)
+        return z
+
+    def decode(self, z):
+        return self.decoder(z)
+    
+class CVAE(nn.Module):
+    """Conditional VAE model.
+    Code inspired by J. Heek et al., Flax: A neural network library and ecosystem for JAX. 2024."""
+
+    output_dim: Sequence[int]
+    latent_dim: int = 20
+    hidden_layer_dims_enc: Sequence[int] = (1024, 512)
+    hidden_layer_dims_dec: Sequence[int] = (512, 1024)
+    activation: str = "silu"
+    
+class CVAE(nn.Module):
+    """Conditional VAE model.
+    Code inspired by J. Heek et al., Flax: A neural network library and ecosystem for JAX. 2024."""
+
+    output_dim: Sequence[int]
+    latent_dim: int = 20
+    hidden_layer_dims_enc: Sequence[int] = (1024, 512)
+    hidden_layer_dims_dec: Sequence[int] = (512, 1024)
+    activation: str = "silu"
+    n_step_lookahead: int = 4
+
+    def setup(self):
+        self.encoder = Encoder(latent_dim=self.latent_dim, hidden_layer_dims=self.hidden_layer_dims_enc, activation=self.activation)
+        self.decoder = Decoder(output_dim=self.output_dim, hidden_layer_dims=self.hidden_layer_dims_dec, activation=self.activation)
+
+    def reparameterize(self, rng, mean, logvar):
+        std = jnp.exp(0.5 * logvar)
+        eps = random.normal(rng, logvar.shape)
+        return mean + eps * std
+
+    def __call__(self, x, condition, z_rng):
+        mean, logvar = self.encoder(jnp.concatenate([x, condition], axis=-1))
+        z = self.reparameterize(z_rng, mean, logvar)
+        recon_x = self.decoder(jnp.concatenate([z, condition], axis=-1))
+        return z, mean, logvar, recon_x
+
+    def get_cvae_obs(self, traj_data, traj_state, current_qpos, current_qvel, qpos_ind, qvel_ind, quat_in_qpos, backend):
+        # traj_data = env.th.traj.data
+        # jax.debug.print("traj_state.subtraj_step_no: {x}", x=traj_state.subtraj_step_no)
+        
+        traj_data_single = traj_data.get(traj_state.traj_no, traj_state.subtraj_step_no, backend)
+        qpos_traj = jnp.atleast_2d(traj_data_single.qpos)
+        qvel_traj = jnp.atleast_2d(traj_data_single.qvel)
+        
+        qpos, qvel = current_qpos[:, qpos_ind], current_qvel[:, qvel_ind]
+        qpos_quat = qpos[:, quat_in_qpos]
+        qpos_quat_traj = qpos_traj[:, qpos_ind][:, quat_in_qpos]
+        qpos_quat_rel = jax.vmap(
+            lambda q1, q2: quaternion_relative_rotation(q1, q2, backend)
+        )(qpos_quat, qpos_quat_traj)
+
+        if self.n_step_lookahead > 0:
+            future_qpos_traj = []
+            future_qvel_traj = []
+            future_site_rpos = []
+            future_site_rangles = []
+            future_site_rvel = []
+            
+            # for power of two steps after the current state
+            for i in [2**k for k in range(0, self.n_step_lookahead)]:
+                
+                future_traj_data_single = traj_data.get(traj_state.traj_no, traj_state.subtraj_step_no + i, backend)
+
+                qpos_quat_future_traj = jnp.atleast_2d(future_traj_data_single.qpos)[:, qpos_ind][:, quat_in_qpos]
+                future_qpos_quat_rel = jax.vmap(
+                    lambda q1, q2: quaternion_relative_rotation(q1, q2, backend)
+                )(qpos_quat, qpos_quat_future_traj)
+                future_qpos_traj.append(backend.concatenate([future_qpos_quat_rel, jnp.atleast_2d(future_traj_data_single.qpos)[:, qpos_ind][:, ~quat_in_qpos] - qpos[:, ~quat_in_qpos]], axis=-1))
+                future_qvel_traj.append(jnp.atleast_2d(future_traj_data_single.qvel)[:, qvel_ind] - qvel)
+
+            future_qpos_traj = backend.stack(future_qpos_traj, axis=1)
+            future_qvel_traj = backend.stack(future_qvel_traj, axis=1)
+
+            traj_goal_obs = backend.concatenate([
+                # Trajectory joint positions and velocities for the current state
+                qpos_quat_rel,
+                qpos_traj[:, qpos_ind][:, ~quat_in_qpos] - qpos[:, ~quat_in_qpos],
+                qvel_traj[:, qvel_ind] - qvel,
+                # # Trajectory site positions, angles and velocities relative to the root site for the current state
+                # backend.ravel(site_rpos),
+                # backend.ravel(site_rangles),
+                # backend.ravel(site_rvel),
+                # Trajectory joint positions and velocities for the future states
+                future_qpos_traj.reshape(future_qpos_traj.shape[0], -1),
+                future_qvel_traj.reshape(future_qvel_traj.shape[0], -1),
+            ], axis=1)
+        else:
+            traj_goal_obs = backend.concatenate([
+                # Trajectory joint positions and velocities of the current simulation state
+                qpos_quat_rel,
+                qpos_traj[:, qpos_ind][:, ~quat_in_qpos] - qpos[:, ~quat_in_qpos],
+                qvel_traj[:, qvel_ind] - qvel,
+                # Trajectory site positions, angles and velocities relative to the root site of the current simulation state
+                # backend.ravel(site_rpos),
+                # backend.ravel(site_rangles),
+                # backend.ravel(site_rvel),
+            ], axis=1)
+
+        return traj_goal_obs
+
+    # def encode(self, x, condition, z_rng):
+    #     mean, logvar = self.encoder(jnp.concatenate([x, condition], axis=-1))
+    #     z = self.reparameterize(z_rng, mean, logvar)
+    #     return z
+
+    # def decode(self, z, condition):
+    #     return self.decoder(jnp.concatenate([z, condition], axis=-1))
 
 class RunningMeanStd(nn.Module):
     """Layer that maintains running mean and variance for input normalization."""

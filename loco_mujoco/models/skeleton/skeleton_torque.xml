@@ -77,7 +77,7 @@
           <body name="talus_l" pos="       0 -0.480173        0" quat="1.0 0.0 0.0 0.0">
             <geom name="talus_lv" type="mesh" mesh="talus_lv"></geom>
             <inertial pos="       0        0        0" mass="0.11524999800438" fullinertia="0.00143714 0.00143714 0.00143714        0        0        0"></inertial>
-            <joint name="ankle_angle_l"  stiffness="10" damping="1" type="hinge" pos="0 0 0" axis="0.105014 0.174022 0.979126" limited="true" range=" -1.0472   1.0472" ref="0"></joint>
+            <joint name="ankle_angle_l"  stiffness="10" damping="1" type="hinge" pos="0 0 0" axis="0.105014 0.174022 0.979126" limited="true" range=" -1.5708   1.5708" ref="0"></joint>
             <body name="calcn_l" pos="-0.0544606 -0.0468448 -0.00884412" quat="1.0 0.0 0.0 0.0">
               <site name="left_foot_mimic" class="mimic" pos="0.10 0.03 0.0"/>
               <geom name="l_foot" type="mesh" mesh="l_foot" condim="3"></geom>
@@ -86,7 +86,7 @@
               <body name="toes_l" pos="0.190515 -0.00213104 -0.00115076" quat="1.0 0.0 0.0 0.0">
                 <geom name="l_bofoot" type="mesh" mesh="l_bofoot" condim="3"></geom>
                 <inertial pos="0.036867 0.00639311 0.0186466" mass="0.249631495677486" fullinertia="0.000130847 0.000261694 0.00130847        0        0        0"></inertial>
-                <joint name="mtp_angle_l" armature="0.01" type="hinge" pos="0 0 0" axis="0.580954        0 0.813936" limited="true" range=" -1.0472   1.0472" ref="0"></joint>
+                <joint name="mtp_angle_l" armature="0.01" type="hinge" pos="0 0 0" axis="0.580954        0 0.813936" limited="true" range=" -1.5708   1.5708" ref="0"></joint>
               </body>
             </body>
           </body>

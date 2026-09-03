@@ -17,7 +17,8 @@ from loco_mujoco.core.stateful_object import StatefulObject
 from loco_mujoco.core.utils.math import (
     calculate_relative_site_quatities,
     quat_scalarfirst2scalarlast,
-    quat_scalarlast2scalarfirst
+    quat_scalarlast2scalarfirst,
+    quaternion_relative_rotation
 )
 from loco_mujoco.core.utils.mujoco import (
     mj_jntid2qposid, mj_jntid2qvelid,
@@ -780,10 +781,10 @@ class GoalTrajMimic(Goal):
         size_for_sites = (3 + 3 + 6) * n_sites
 
         if self.full_obs_lookahead:
-            self._dim = (size_for_joint_pos + size_for_joint_vel + size_for_sites) * self.n_step_lookahead
+            self._dim = (size_for_joint_pos + size_for_joint_vel + size_for_sites) * (self.n_step_lookahead + 1)
         else:
-            self._dim = size_for_joint_pos + size_for_joint_vel + size_for_sites + 9 * (self.n_step_lookahead - 1)
-        self._size_additional_observation = size_for_sites
+            self._dim = (size_for_joint_pos + size_for_joint_vel) * (self.n_step_lookahead + 1) #+ size_for_sites
+        self._size_additional_observation = 0#size_for_sites
 
         self._rel_site_ids = np.array(self._rel_site_ids)
         self._body_rootid = model.body_rootid
@@ -795,6 +796,8 @@ class GoalTrajMimic(Goal):
             [mj_jntid2qposid(i, model) for i in range(model.njnt) if i != root_free_joint_id]
         )
         self._qvel_ind = np.concatenate([mj_jntid2qvelid(i, model) for i in range(model.njnt)])
+        quat_in_qpos_ind = np.concatenate([mj_jntid2qposid(i, model)[3:] for i in range(model.njnt) if i == root_free_joint_id])
+        self._quat_in_qpos = np.array([True if q in quat_in_qpos_ind else False for q in self._qpos_ind])
 
         self.min = [-np.inf] * self.dim
         self.max = [np.inf] * self.dim
@@ -841,30 +844,41 @@ class GoalTrajMimic(Goal):
         qpos_traj = traj_data_single.qpos
         qvel_traj = traj_data_single.qvel
 
+        qpos, qvel = data.qpos[self._qpos_ind], data.qvel[self._qvel_ind]
+        qpos_quat = qpos[self._quat_in_qpos]
+        qpos_quat_traj = qpos_traj[self._qpos_ind][self._quat_in_qpos]
+        qpos_quat_rel = quaternion_relative_rotation(qpos_quat, qpos_quat_traj, backend)
+
         rel_site_ids = self._rel_site_ids
         rel_body_ids = self._site_bodyid[rel_site_ids]
         site_rpos, site_rangles, site_rvel = calculate_relative_site_quatities(traj_data_single, rel_site_ids,
                                                                                rel_body_ids,
                                                                                self._body_rootid, backend)
         
-        if self.n_step_lookahead > 1:
+        if self.n_step_lookahead > 0:
             future_qpos_traj = jnp.array([])
             future_qvel_traj = jnp.array([])
             future_site_rpos = jnp.array([])
             future_site_rangles = jnp.array([])
             future_site_rvel = jnp.array([])
+            
             # for power of two steps after the current state
-            for i in [2**k - 1 for k in range(1, self.n_step_lookahead)]:
+            for i in [2**k for k in range(0, self.n_step_lookahead)]:
                 future_traj_data_single = traj_data.get(traj_state.traj_no, traj_state.subtraj_step_no + i, backend)
 
+                qpos_quat_future_traj = future_traj_data_single.qpos[self._qpos_ind][self._quat_in_qpos]
+                future_qpos_traj = jnp.append(future_qpos_traj, quaternion_relative_rotation(qpos_quat, qpos_quat_future_traj, backend))
+                
                 if not self.full_obs_lookahead:
                     # Only use the root body
-                    future_qpos_traj = jnp.append(future_qpos_traj, future_traj_data_single.qpos[self._qpos_ind][:3])
-                    future_qvel_traj = jnp.append(future_qvel_traj, future_traj_data_single.qvel[self._qvel_ind][:6])
+                    future_qpos_traj = jnp.append(future_qpos_traj, future_traj_data_single.qpos[self._qpos_ind][~self._quat_in_qpos] - qpos[~self._quat_in_qpos])
+                    future_qvel_traj = jnp.append(future_qvel_traj, future_traj_data_single.qvel[self._qvel_ind] - qvel)
+                    # future_qpos_traj = jnp.append(future_qpos_traj, future_traj_data_single.qpos[self._qpos_ind][:3])
+                    # future_qvel_traj = jnp.append(future_qvel_traj, future_traj_data_single.qvel[self._qvel_ind][:6])
                 else:
                     # Use full observation
-                    future_qpos_traj = jnp.append(future_qpos_traj, future_traj_data_single.qpos[self._qpos_ind])
-                    future_qvel_traj = jnp.append(future_qvel_traj, future_traj_data_single.qvel[self._qvel_ind])
+                    future_qpos_traj = jnp.append(future_qpos_traj, future_traj_data_single.qpos[self._qpos_ind][~self._quat_in_qpos] - qpos[~self._quat_in_qpos])
+                    future_qvel_traj = jnp.append(future_qvel_traj, future_traj_data_single.qvel[self._qvel_ind] - qvel)
 
                     future_site = calculate_relative_site_quatities(future_traj_data_single, rel_site_ids,
                                                                     rel_body_ids,
@@ -874,13 +888,14 @@ class GoalTrajMimic(Goal):
                     future_site_rvel = jnp.append(future_site_rvel, future_site[2])
 
             traj_goal_obs = backend.concatenate([
-                # Trajectory joint positions and velocities for the next state
-                qpos_traj[self._qpos_ind],
-                qvel_traj[self._qvel_ind],
-                # Trajectory site positions, angles and velocities relative to the root site for the next state
-                backend.ravel(site_rpos),
-                backend.ravel(site_rangles),
-                backend.ravel(site_rvel),
+                # Trajectory joint positions and velocities for the current state
+                qpos_quat_rel,
+                qpos_traj[self._qpos_ind][~self._quat_in_qpos] - qpos[~self._quat_in_qpos],
+                qvel_traj[self._qvel_ind] - qvel,
+                # # Trajectory site positions, angles and velocities relative to the root site for the next state
+                # backend.ravel(site_rpos),
+                # backend.ravel(site_rangles),
+                # backend.ravel(site_rvel),
                 # Trajectory joint positions and velocities for the future states
                 backend.ravel(future_qpos_traj),
                 backend.ravel(future_qvel_traj),
@@ -896,12 +911,13 @@ class GoalTrajMimic(Goal):
         else:
             traj_goal_obs = backend.concatenate([
                 # Trajectory joint positions and velocities of the current simulation state
-                qpos_traj[self._qpos_ind],
-                qvel_traj[self._qvel_ind],
+                qpos_quat_rel,
+                qpos_traj[self._qpos_ind][~self._quat_in_qpos] - qpos[~self._quat_in_qpos],
+                qvel_traj[self._qvel_ind] - qvel,
                 # Trajectory site positions, angles and velocities relative to the root site of the current simulation state
-                backend.ravel(site_rpos),
-                backend.ravel(site_rangles),
-                backend.ravel(site_rvel),
+                # backend.ravel(site_rpos),
+                # backend.ravel(site_rangles),
+                # backend.ravel(site_rvel),
             ])
 
         if self.visualize_goal:

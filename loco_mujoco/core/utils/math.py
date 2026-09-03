@@ -434,6 +434,25 @@ def quat2angle(quat, backend):
     return R.from_quat(quat).as_rotvec()
 
 
+def quaternion_relative_rotation(q1, q2, backend):
+    """
+    Calculates the relative rotation between two quaternions.
+    """
+    if backend == np:
+        R = np_R
+    else:
+        R = jnp_R
+
+    # Create Rotation objects for both quaternions
+    r1 = R.from_quat(q1)
+    r2 = R.from_quat(q2)
+
+    # Compute the relative rotation
+    relative_rotation = r2 * r1.inv()
+
+    return relative_rotation.as_quat()
+
+
 def quat_scalarfirst2scalarlast(quat):
     """
     Converts a quaternion from scalar-first to scalar-last representation.

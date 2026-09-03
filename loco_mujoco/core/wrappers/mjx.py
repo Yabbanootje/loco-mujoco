@@ -109,6 +109,13 @@ class SummaryMetrics:
     min_episode_return: float = 0.0
     min_episode_length: float = 0.0
     num_episodes: int = 0
+    absorbing_episodes: int = 0
+    success_rate: float = 0.0
+    total_loss: float = 0.0
+    value_loss: float = 0.0
+    loss_actor: float = 0.0
+    recon_loss: float = 0.0
+    kld_loss: float = 0.0
 
 
 @struct.dataclass
@@ -119,6 +126,7 @@ class Metrics:
     returned_episode_lengths: int
     timestep: int
     done: bool
+    absorbing: bool
 
 
 @struct.dataclass
@@ -133,7 +141,7 @@ class LogWrapper(BaseWrapper):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, rng_key):
         obs, env_state = self.env.reset(rng_key)
-        state = LogEnvState(env_state, metrics=Metrics(0, 0, 0, 0, 0, False))
+        state = LogEnvState(env_state, metrics=Metrics(0, 0, 0, 0, 0, False, False))
         return obs, state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -154,7 +162,8 @@ class LogWrapper(BaseWrapper):
                 returned_episode_lengths=state.metrics.returned_episode_lengths * (1 - done)
                                          + new_episode_length * done,
                 timestep=state.metrics.timestep + 1,
-                done=done,),
+                done=done,
+                absorbing=absorbing,),
         )
         return next_observation, reward, absorbing, done, info, state
 

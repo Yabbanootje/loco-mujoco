@@ -834,7 +834,8 @@ class Mujoco:
             init_state_handler_state=self._init_state_handler.init_state(self, _k5, model, data, backend),
             control_func_state=self._control_func.init_state(self, _k6, model, data, backend),
             terminal_state_handler_state=self._terminal_state_handler.init_state(self, _k7, model, data, backend),
-            user_scene=MjvScene.init_for_all_stateful_objects(backend))
+            user_scene=MjvScene.init_for_all_stateful_objects(backend),
+        )
 
         return carry
 

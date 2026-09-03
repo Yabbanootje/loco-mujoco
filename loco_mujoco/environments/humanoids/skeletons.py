@@ -221,6 +221,21 @@ class SkeletonTorque(BaseSkeleton):
         super(SkeletonTorque, self).__init__(use_muscles=False, **kwargs)
 
     @staticmethod
+    def _get_observation_specification(spec: MjSpec) -> List[ObservationType]:
+        """
+        Returns the observation specification of the environment.
+
+        Args:
+            spec (MjSpec): Specification of the environment.
+
+        Returns:
+            A list of observation types.
+        """
+        observation_spec = super(SkeletonTorque, SkeletonTorque)._get_observation_specification(spec)
+        observation_spec.append(ObservationType.LastAction(obs_name="last_action"))
+        return observation_spec
+
+    @staticmethod
     def _get_action_specification(spec: MjSpec) -> List[str]:
         """
         Getter for the action space specification.
