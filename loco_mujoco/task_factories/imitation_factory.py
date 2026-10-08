@@ -8,7 +8,8 @@ import loco_mujoco
 from loco_mujoco.environments.base import LocoEnv
 from loco_mujoco.trajectory import Trajectory, TrajectoryHandler
 from loco_mujoco.smpl.retargeting import load_retargeted_amass_trajectory, extend_motion, load_robot_conf_file
-from loco_mujoco.smpl.const import AMASS_LOCOMOTION_DATASETS
+from loco_mujoco.smpl.const import (AMASS_LOCOMOTION_DATASETS, KINESIS_TRAIN_LOCOMOTION_DATASETS, KINESIS_TEST_LOCOMOTION_DATASETS,
+                                    OUR_TRAIN_LOCOMOTION_DATASETS, OUR_TEST_LOCOMOTION_DATASETS)
 from loco_mujoco.datasets.humanoids.LAFAN1 import load_lafan1_trajectory
 from loco_mujoco.datasets.humanoids.LAFAN1 import (LAFAN1_LOCOMOTION_DATASETS,
                                                    LAFAN1_DANCE_DATASETS, LAFAN1_ALL_DATASETS)
@@ -66,7 +67,9 @@ class ImitationFactory(TaskFactory):
         env_cls = LocoEnv.registered_envs[env_name]
 
         # Create and return the environment
+        print(f"Creating environment '{env_name}' with imitation learning task.")
         env = env_cls(init_state_type=init_state_type, terminal_state_type=terminal_state_type, **kwargs)
+        print("Created environment with reward function:", env._reward_function)
 
         all_trajs = []
 
@@ -204,6 +207,14 @@ class ImitationFactory(TaskFactory):
         if amass_dataset_conf.dataset_group is not None:
             if amass_dataset_conf.dataset_group == "AMASS_LOCOMOTION_DATASETS":
                 dataset_paths.extend(AMASS_LOCOMOTION_DATASETS)
+            elif amass_dataset_conf.dataset_group == "KINESIS_TRAIN_LOCOMOTION_DATASETS":
+                dataset_paths.extend(KINESIS_TRAIN_LOCOMOTION_DATASETS)
+            elif amass_dataset_conf.dataset_group == "KINESIS_TEST_LOCOMOTION_DATASETS":
+                dataset_paths.extend(KINESIS_TEST_LOCOMOTION_DATASETS)
+            elif amass_dataset_conf.dataset_group == "OUR_TRAIN_LOCOMOTION_DATASETS":
+                dataset_paths.extend(OUR_TRAIN_LOCOMOTION_DATASETS)
+            elif amass_dataset_conf.dataset_group == "OUR_TEST_LOCOMOTION_DATASETS":
+                dataset_paths.extend(OUR_TEST_LOCOMOTION_DATASETS)
             else:
                 raise ValueError(f"Unknown dataset group: {amass_dataset_conf.dataset_group}")
         if amass_dataset_conf.rel_dataset_path is not None:
@@ -251,6 +262,7 @@ class ImitationFactory(TaskFactory):
                 else [lafan1_dataset_conf.dataset_name]
 
         # Load LAFAN1 Trajectory
+        print("Loading LAFAN1 trajectory with env._reward_function:", env._reward_function)
         traj = load_lafan1_trajectory(env.__class__.__name__, dataset_paths)
 
         # pass the default trajectory through a TrajectoryHandler to interpolate it to the environment frequency

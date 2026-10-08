@@ -740,7 +740,7 @@ class DefaultRandomizer(DomainRandomizer):
         sampled_base_mass_multiplier = (
             mult_base_min + (mult_base_max - mult_base_min) * interpolation[0]
             if self.rand_conf["randomize_link_mass"]
-            else backend.array([1.0])
+            else backend.array(1.0)
         )
 
         sampled_base_mass_multiplier = jnp.expand_dims(sampled_base_mass_multiplier, axis=0)

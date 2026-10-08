@@ -157,7 +157,9 @@ def add_mocap_bodies(mjspec: MjSpec,
                      sites_for_mimic: List[str],
                      mocap_bodies: List[str],
                      robot_conf: DictConfig = None,
-                     add_equality_constraint: bool = True):
+                     add_equality_constraint: bool = True,
+                     height_adjustment_geom_names: List[str] = None,
+                     max_height_adjustment: float = 1.0):
     """
     Add mocap bodies to the model specification.
 
@@ -167,6 +169,9 @@ def add_mocap_bodies(mjspec: MjSpec,
         mocap_bodies (List[str]): The names of the mocap bodies to be added to the model specification.
         mocap_bodies_init_pos: The initial positions of the mocap bodies.
         add_equality_constraint (bool): Whether to add equality constraints between the sites and the mocap bodies.
+        height_adjustment_geom_names (List[str]): The names of the geoms to be used for height adjustment of the
+            trajectory.
+        max_height_adjustment (float): The maximum height adjustment for the geoms.
 
     """
 
@@ -178,6 +183,11 @@ def add_mocap_bodies(mjspec: MjSpec,
         for g in mjspec.geoms:
             g.contype = 0
             g.conaffinity = 0
+
+    for g in mjspec.geoms:
+        if height_adjustment_geom_names is not None and g.name in height_adjustment_geom_names:
+            g.margin = max_height_adjustment
+            g.gap = max_height_adjustment
 
     for mb_name in mocap_bodies:
         b_handle = mjspec.worldbody.add_body(name=mb_name, mocap=True)
@@ -307,7 +317,7 @@ def optimize_for_collisions(
     mjspec = env.mjspec
     sites_for_mimic = env.sites_for_mimic
     target_mocap_bodies = ["target_mocap_body_" + s for s in sites_for_mimic]
-    mjspec = add_mocap_bodies(mjspec, sites_for_mimic, target_mocap_bodies)
+    mjspec = add_mocap_bodies(mjspec, sites_for_mimic, target_mocap_bodies, env.foot_geom_names)
     env.reload_mujoco(mjspec)
 
     traj_data, traj_info = interpolate_trajectories(traj.data, traj.info, 1.0 / env.dt)

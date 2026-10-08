@@ -300,7 +300,7 @@ class PPOJax(JaxRLAlgorithmBase):
         reset_rng = jax.random.split(_rng, config.num_envs)
         obsv, env_state = env.reset(reset_rng)
 
-        train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)
+        train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)        
 
         # TRAIN LOOP
         @scan_tqdm(config.num_updates, print_rate=1, desc='PPO JAX Training')

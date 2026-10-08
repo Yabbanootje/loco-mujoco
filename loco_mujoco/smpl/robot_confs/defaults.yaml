@@ -79,6 +79,8 @@ optimization_params:
   smoothing_sigma: 0.5  # used in robot2robot retargeting
   pos_loss_weight: 1.0  # used in robot2robot retargeting
   rot_loss_weight: 0.1  # used in robot2robot retargeting
+  max_height_adjustment: 1.0
+  height_adjustment_geom_names: []
 
 
 

@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import yaml
 
 __version__ = '1.0.1'
 
@@ -15,6 +17,12 @@ try:
 
     def get_registered_envs():
         return LocoEnv.registered_envs
+
+    def get_variable(key):
+        try:
+            return yaml.load(open(PATH_TO_VARIABLES), Loader=yaml.FullLoader)[key]
+        except KeyError:
+            return None
 
 except ImportError as e:
     print(e)
