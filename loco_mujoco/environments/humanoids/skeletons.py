@@ -690,7 +690,24 @@ class SkeletonMuscle(BaseSkeleton):
         """
         observation_spec = super(SkeletonMuscle, SkeletonMuscle)._get_observation_specification(spec)
         observation_spec.append(ObservationType.LastAction(obs_name="last_action"))
+        observation_spec.append(ObservationType.LastActivation(obs_name="last_activation"))
         return observation_spec
+
+    def _mjx_simulation_post_step(self, model, data, carry):
+        """
+        Applies post-step modifications to the data and carry.
+
+        Args:
+            model (Model): Mujoco model.
+            data (Data): Mujoco data structure.
+            carry (MjxAdditionalCarry): Additional carry information.
+
+        Returns:
+            Tuple[Data, MjxAdditionalCarry]: Updated data and carry.
+        """
+        data, carry = super()._mjx_simulation_post_step(model, data, carry)
+        carry = carry.replace(last_activation=data.act.copy())
+        return data, carry
 
     @staticmethod
     def _get_action_specification(spec: MjSpec) -> List[str]:

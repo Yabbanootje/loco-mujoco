@@ -23,6 +23,7 @@ class Transition(NamedTuple):
     metrics: Metrics
     cvae_obs_x: jnp.ndarray
     cvae_obs_cond: jnp.ndarray
+    cvae_epsilon: jnp.ndarray
 
 
 class MetricHandlerTransition(NamedTuple):

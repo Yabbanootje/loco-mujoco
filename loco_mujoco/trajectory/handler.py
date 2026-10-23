@@ -26,7 +26,7 @@ class TrajectoryHandler(StatefulObject):
 
     """
     def __init__(self, model, traj_path=None, traj: Trajectory = None, control_dt=0.01, random_start=True,
-                 fixed_start_conf=None, clip_trajectory_to_joint_ranges=False, warn=True):
+                 fixed_start_conf=None, biased_sampling=False, clip_trajectory_to_joint_ranges=False, warn=True):
         """
         Constructor.
 
@@ -57,10 +57,11 @@ class TrajectoryHandler(StatefulObject):
         # todo: implement this in observation types in init_from_traj!
         #self.check_if_trajectory_is_in_range(low, high, keys, joint_pos_idx, warn, clip_trajectory_to_joint_ranges)
 
-        assert (fixed_start_conf is not None) != random_start, "Please specify either fixed_start_conf or random_start."
+        assert (fixed_start_conf is not None) + random_start + biased_sampling == 1, "Please specify either fixed_start_conf, biased_sampling or random_start."
         self.random_start = random_start
         self.fixed_start_conf = fixed_start_conf
         self.use_fixed_start = True if fixed_start_conf is not None else False
+        self.biased_sampling = biased_sampling
 
         self.traj_dt = 1 / traj_info.frequency
         self.control_dt = control_dt
@@ -232,22 +233,45 @@ class TrajectoryHandler(StatefulObject):
 
     def reset_state(self, env, model, data, carry, backend):
 
+        def _selected_idx():
+            traj_idx = backend.asarray(carry.selected_traj_idx, dtype=backend.int32)
+            return traj_idx, backend.asarray(0, dtype=backend.int32)
+
         key = carry.key
 
-        if self.random_start:
-            if backend == jnp:
+        selected_traj_idx = getattr(carry, "selected_traj_idx", None)
+        if backend == jnp and selected_traj_idx is not None:
+            key, traj_idx, subtraj_step_idx = jax.lax.cond(
+                selected_traj_idx >= 0,
+                lambda _: (key, *_selected_idx()),
+                lambda _: (key, 0, 0),
+                operand=None,
+            )
+            idx = [traj_idx, subtraj_step_idx]
+        elif selected_traj_idx is not None and int(selected_traj_idx) >= 0:
+            traj_idx, subtraj_step_idx = _selected_idx()
+            idx = [traj_idx, subtraj_step_idx]
+        else:
+            if self.random_start:
+                if backend == jnp:
+                    key, _k1, _k2 = jax.random.split(key, 3)
+                    traj_idx = jax.random.randint(_k1, shape=(1,), minval=0, maxval=self.n_trajectories)
+                    subtraj_step_idx = jax.random.randint(_k2, shape=(1,), minval=0, maxval=self.len_trajectory(traj_idx))
+                    idx = [traj_idx[0], subtraj_step_idx[0]]
+                else:
+                    traj_idx = np.random.randint(0, self.n_trajectories)
+                    subtraj_step_idx = np.random.randint(0, self.len_trajectory(traj_idx))
+                    idx = [traj_idx, subtraj_step_idx]
+            elif self.use_fixed_start:
+                idx = self.fixed_start_conf
+            elif self.biased_sampling:
+                assert hasattr(carry, 'log_probs'), "carry must be of type LocoCarry for biased sampling."
                 key, _k1, _k2 = jax.random.split(key, 3)
-                traj_idx = jax.random.randint(_k1, shape=(1,), minval=0, maxval=self.n_trajectories)
+                traj_idx = jax.random.categorical(_k1, logits=carry.log_probs, shape=(1,), replace=True)
                 subtraj_step_idx = jax.random.randint(_k2, shape=(1,), minval=0, maxval=self.len_trajectory(traj_idx))
                 idx = [traj_idx[0], subtraj_step_idx[0]]
             else:
-                traj_idx = np.random.randint(0, self.n_trajectories)
-                subtraj_step_idx = np.random.randint(0, self.len_trajectory(traj_idx))
-                idx = [traj_idx, subtraj_step_idx]
-        elif self.use_fixed_start:
-            idx = self.fixed_start_conf
-        else:
-            idx = [0, 0]
+                idx = [0, 0]
 
         new_traj_no, new_subtraj_step_no = idx
         new_subtraj_step_no_init = new_subtraj_step_no

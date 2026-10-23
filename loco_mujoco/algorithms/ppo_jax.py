@@ -22,11 +22,12 @@ import pandas as pd
 
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic, LatticeActorCritic,
                                     CVAE, Transition, TrainState, TrainStateBuffer, MetricHandlerTransition)
-from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
+from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics, BaseWrapperState
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 from loco_mujoco.core.utils.mujoco import (
     mj_jntid2qposid, mj_jntid2qvelid,
 )
+from loco_mujoco.core.mujoco_mjx import MjxState
 
 
 @dataclass(frozen=True)
@@ -674,6 +675,50 @@ class PPOJax(JaxRLAlgorithmBase):
 
                 jax.debug.callback(callback, env_state.metrics)
 
+            def refresh_sampling(
+                state: Any,
+            ) -> Any:
+                """Refresh shared probabilities from this window's local failure counts.
+
+                Requirements:
+                    - Call outside the environment-level vmap.
+                    - Counts and probabilities have shape (num_envs, num_trajectories).
+                    - Probability rows are identical, finite, and normalized.
+
+                With no failures, retain the previous probabilities.
+                """
+                def replace_carry(state: Any, new_carry: Any) -> Any:
+                    """Replace the underlying carry without changing other wrapper fields."""
+                    if isinstance(state, MjxState):
+                        return state.replace(additional_carry=new_carry)
+
+                    if isinstance(state, BaseWrapperState):
+                        return state.replace(
+                            env_state=replace_carry(state.env_state, new_carry)
+                        )
+
+                    raise TypeError(f"Unsupported state type: {type(state).__name__}")
+
+                carry = state.additional_carry
+                failure_counts = carry.failure_counts
+                old_probs = carry.log_probs
+
+                # Aggregate independent per-environment counters.
+                totals = failure_counts.astype(old_probs.dtype).sum(axis=0) + 1.0
+                total_failures = totals.sum()
+
+                # Calculate probabilities and update carry
+                failure_probs = totals / total_failures
+                new_carry = carry.replace(
+                    failure_counts=jnp.zeros_like(failure_counts),
+                    log_probs=jnp.broadcast_to(jnp.log(failure_probs), old_probs.shape),
+                )
+                return replace_carry(state, new_carry)
+
+            # update sampling
+            if config.env_params.th_params.biased_sampling:
+                env_state = refresh_sampling(env_state)
+
             # add train state to buffer if needed
             train_state_buffer = jax.lax.cond(counter % config.validation_interval == 0,
                                               lambda x, y: TrainStateBuffer.add(x, y),
@@ -694,7 +739,6 @@ class PPOJax(JaxRLAlgorithmBase):
                 "training_metrics": metrics[0],
                 "validation_metrics": metrics[1]}
 
-    @classmethod
     @classmethod
     def play_policy(cls, env,
                     agent_conf: PPOAgentConf,

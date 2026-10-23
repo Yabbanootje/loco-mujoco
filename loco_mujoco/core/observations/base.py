@@ -944,6 +944,36 @@ class LastAction(StatefulObservation):
         return backend.ravel(carry.last_action), carry
 
 
+class LastActivation(StatefulObservation):
+
+    def __init__(self, obs_name: str, **kwargs):
+        super().__init__(obs_name, **kwargs)
+        self.dim = None
+
+    def _init_from_mj(self, env, model, data, current_obs_size):
+        self.dim = env.action_dim - 14
+        self.min, self.max = [-np.inf] * self.dim, [np.inf] * self.dim
+        self.obs_ind = np.array([j for j in range(current_obs_size, current_obs_size + self.dim)])
+        self._initialized_from_mj = True
+
+    def get_obs_and_update_state(self, env, model, data, carry, backend):
+        """
+        Get the observation and update the state.
+
+        Args:
+            env: The environment.
+            model: The Mujoco model.
+            data: The Mujoco data structure.
+            carry: The state carry.
+            backend: The backend to use, either np or jnp.
+
+        Returns:
+            The observation and the updated state.
+
+        """
+        return backend.ravel(carry.last_activation), carry
+
+
 class ModelInfo(StatefulObservation):
 
     def __init__(self, obs_name: str, model_attributes: Union[str, List[str]], **kwargs):
@@ -1104,6 +1134,7 @@ class ObservationType:
     ProjectedGravityVector = ProjectedGravityVector
     Force = Force
     LastAction = LastAction
+    LastActivation = LastActivation
     ModelInfo = ModelInfo
     RelativeSiteQuantaties = RelativeSiteQuantaties
 

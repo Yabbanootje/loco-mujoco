@@ -34,6 +34,9 @@ class LocoCarry(MjxAdditionalCarry):
         traj_state (TrajState): Trajectory state.
     """
     traj_state: TrajState
+    failure_counts: jax.Array
+    log_probs: jax.Array
+    selected_traj_idx: jax.Array = None
 
 
 class LocoEnv(Mjx):
@@ -125,6 +128,34 @@ class LocoEnv(Mjx):
             obs_entry.init_from_traj(self.th)
         self._goal.init_from_traj(self.th)
         self._terminal_state_handler.init_from_traj(self.th)
+
+    def _mjx_is_absorbing(self, obs: jnp.ndarray,
+                              info: Dict,
+                              data: Data,
+                              carry: LocoCarry) -> bool:
+            """
+            Determines if the current state is absorbing.
+    
+            Args:
+                obs (jnp.ndarray): Current observation.
+                info (Dict): Information dictionary.
+                data (Data): Mujoco data structure.
+                carry (LocoCarry): Additional carry information.
+    
+            Returns:
+                bool: True if the state is absorbing, False otherwise.
+            """
+            absorbing, carry = super()._mjx_is_absorbing(obs, info, data, carry)
+            def _update_failure_counts(carry: LocoCarry):
+                failure_counts = carry.failure_counts
+                failure_counts = failure_counts.at[carry.traj_state.traj_no].set(failure_counts[carry.traj_state.traj_no] + 1)
+                return failure_counts
+            failure_counts = jax.lax.cond(absorbing,
+                                          lambda carry: _update_failure_counts(carry),
+                                          lambda carry: carry.failure_counts,
+                                          carry)
+            carry = carry.replace(failure_counts=failure_counts)
+            return absorbing, carry
 
     def _is_done(self, obs: np.ndarray,
                  absorbing: bool,
@@ -616,6 +647,8 @@ class LocoEnv(Mjx):
         # create additional carry
         carry = LocoCarry(
             traj_state=self.th.init_state(self, _k, model, data, backend) if self.th is not None else EmptyState(),
+            failure_counts=jax.numpy.zeros(self.th.n_trajectories) if self.th is not None else jax.numpy.zeros(1),
+            log_probs=jax.numpy.log(jax.numpy.ones(self.th.n_trajectories)/self.th.n_trajectories) if self.th is not None else jax.numpy.log(jax.numpy.ones(1)),
             **vars(carry.replace(key=key)))
 
         return carry
