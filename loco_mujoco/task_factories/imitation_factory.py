@@ -212,9 +212,11 @@ class ImitationFactory(TaskFactory):
             elif amass_dataset_conf.dataset_group == "KINESIS_TEST_LOCOMOTION_DATASETS":
                 dataset_paths.extend(KINESIS_TEST_LOCOMOTION_DATASETS)
             elif amass_dataset_conf.dataset_group == "OUR_TRAIN_LOCOMOTION_DATASETS":
-                dataset_paths.extend(OUR_TRAIN_LOCOMOTION_DATASETS)
+                dataset = [traj for traj in OUR_TRAIN_LOCOMOTION_DATASETS if ("Clockwise" not in traj and "turn_" not in traj)]
+                dataset_paths.extend(dataset)
             elif amass_dataset_conf.dataset_group == "OUR_TEST_LOCOMOTION_DATASETS":
-                dataset_paths.extend(OUR_TEST_LOCOMOTION_DATASETS)
+                dataset = [traj for traj in OUR_TEST_LOCOMOTION_DATASETS if ("Clockwise" not in traj and "turn_" not in traj)]
+                dataset_paths.extend(dataset)
             else:
                 raise ValueError(f"Unknown dataset group: {amass_dataset_conf.dataset_group}")
         if amass_dataset_conf.rel_dataset_path is not None:

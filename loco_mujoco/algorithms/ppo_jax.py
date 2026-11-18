@@ -1,3 +1,6 @@
+from __future__ import annotations
+from typing import Callable, NamedTuple
+
 import ast
 import os
 from omegaconf import open_dict
@@ -19,6 +22,7 @@ import optax
 import wandb
 import mujoco
 import pandas as pd
+import copy
 
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic, LatticeActorCritic,
                                     CVAE, Transition, TrainState, TrainStateBuffer, MetricHandlerTransition)
@@ -207,34 +211,15 @@ class PPOJax(JaxRLAlgorithmBase):
                   mh: MetricsHandler = None):
 
         # extract static agent info
-        config, network, tx =\
-            (agent_conf.config.experiment, agent_conf.network, agent_conf.tx)
+        config, network, tx = (agent_conf.config.experiment, agent_conf.network, agent_conf.tx)
+
+        # Give eval env a longer horizon to allow for full trajectory completion
+        eval_env = copy.copy(env)
+        eval_env._mdp_info = copy.copy(env.info)
+        eval_env._mdp_info.horizon = int(getattr(config.validation, "horizon", 10_000))
 
         env = cls._wrap_env(env, config)
-
-        # # derive useful observation index masks from env.obs_container
-        # # (current qpos, current qvel, future/reference, last_action)
-        # obs_items = list(env.obs_container.items())
-        # current_qpos_idx = np.concatenate([obs.obs_ind for _, obs in obs_items
-        #                                    if obs.__class__.data_type() == "qpos"]) \
-        #     if any(obs.__class__.data_type() == "qpos" for _, obs in obs_items) else np.array([], dtype=int)
-        # current_qvel_idx = np.concatenate([obs.obs_ind for _, obs in obs_items
-        #                                    if obs.__class__.data_type() == "qvel"]) \
-        #     if any(obs.__class__.data_type() == "qvel" for _, obs in obs_items) else np.array([], dtype=int)
-
-        # if "last_action" in env.obs_container:
-        #     last_action_idx = np.array(env.obs_container["last_action"].obs_ind, dtype=int)
-        # else:
-        #     last_action_idx = np.concatenate([
-        #         obs.obs_ind for _, obs in obs_items
-        #         if obs.__class__.__name__ == "LastAction" or (obs.name and "last_action" in obs.name.lower())
-        #     ]) if any(obs.__class__.__name__ == "LastAction" or (obs.name and "last_action" in obs.name.lower()) for _, obs in obs_items) else np.array([], dtype=int)
-
-        # # convert to jax arrays for indexing later
-        # current_qpos_idx = jnp.array(current_qpos_idx, dtype=int)
-        # current_qvel_idx = jnp.array(current_qvel_idx, dtype=int)
-        # future_idx = jnp.array(future_idx, dtype=int)
-        # last_action_idx = jnp.array(last_action_idx, dtype=int)
+        eval_env = cls._wrap_env(eval_env, config)
 
         # Get observation indices to give as input and condition to CVAE
         current_state_idx = env._obs_indices.concatenated_indices
@@ -301,11 +286,77 @@ class PPOJax(JaxRLAlgorithmBase):
         reset_rng = jax.random.split(_rng, config.num_envs)
         obsv, env_state = env.reset(reset_rng)
 
-        train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)        
+        train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)
+
+        # One cumulative evaluation-failure count per reference trajectory.
+        biased_sampling = bool(config.env_params.th_params.biased_sampling)
+
+        if biased_sampling and mh is None:
+            raise ValueError("Evaluation-driven sampling requires a MetricsHandler (mh).")
+
+        eval_failure_counts = jnp.ones((env.th.n_trajectories,), dtype=jnp.int32)
+
+        def refresh_sampling(
+            state: Any,
+            accumulated_eval_failures,
+            any_eval_failure,
+        ) -> Any:
+            """Install probabilities from evaluation history.
+
+            accumulated_eval_failures: shape (num_trajectories,)
+            any_eval_failure: scalar bool for the latest evaluation
+
+            The caller increments history once per complete evaluation.
+            Training failure counters do not determine these probabilities.
+            """
+
+            def replace_carry(state: Any, new_carry: Any) -> Any:
+                if isinstance(state, MjxState):
+                    return state.replace(additional_carry=new_carry)
+
+                if isinstance(state, BaseWrapperState):
+                    return state.replace(
+                        env_state=replace_carry(
+                            state.env_state, new_carry
+                        )
+                    )
+
+                raise TypeError(f"Unsupported state type: {type(state).__name__}")
+
+            carry = state.additional_carry
+            old_log_probs = carry.log_probs
+
+            if (
+                accumulated_eval_failures.ndim != 1
+                or old_log_probs.ndim != 2
+                or old_log_probs.shape[-1]
+                != accumulated_eval_failures.shape[0]
+            ):
+                raise ValueError(
+                    "Expected evaluation counts (N,) and "
+                    "training log_probs (B, N)."
+                )
+
+            weights = (accumulated_eval_failures.astype(old_log_probs.dtype))
+
+            total = weights.sum()
+
+            # Safe even with a zero prior and no historical failures.
+            weighted_probs = weights / jnp.where(total > 0, total, 1.0)
+            uniform_probs = (jnp.ones_like(weights) / weights.shape[0])
+
+            # Match PHC's no-failure behavior.
+            # This changes probabilities, but does not erase history.
+            probs = jnp.where(any_eval_failure, weighted_probs, uniform_probs)
+
+            new_carry = carry.replace(log_probs=jnp.broadcast_to(jnp.log(probs), old_log_probs.shape))
+
+            return replace_carry(state, new_carry)
 
         # TRAIN LOOP
         @scan_tqdm(config.num_updates, print_rate=1, desc='PPO JAX Training')
         def _update_step(runner_state, unused):
+            runner_state, eval_failure_counts = runner_state
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, step):
                 train_state, env_state, last_obs, train_state_buffer, rng = runner_state
@@ -592,78 +643,360 @@ class PPOJax(JaxRLAlgorithmBase):
             jax.debug.callback(cls.log_wandb, metric, config.num_steps * config.num_envs * counter)
 
             def _evaluation_step():
+                class EvaluationResult(NamedTuple):
+                    """One element per reference trajectory, in original trajectory order."""
 
-                def _eval_env(runner_state, unused):
-                    train_state, env_state, last_obs, train_state_buffer, rng = runner_state
+                    returns: Any
+                    lengths: Any
+                    action_sizes: Any
+                    absorbing: Any
+                    environment_done: Any
+                    completed: Any
+                    truncated: Any
+                    reference_steps: Any
 
-                    # SELECT ACTION
-                    rng, _rng = jax.random.split(rng)
-                    if hasattr(config, "cvae") and config.cvae.use_cvae:
-                        train_state_cvae = train_state[1]
-                        train_state = train_state[0]
-                        cvae_state = {'params': train_state_cvae.params, 'run_stats': train_state_cvae.run_stats}
-                        rng, z_rng = jax.random.split(rng)
-                        current_state = last_obs[..., current_state_idx]
-                        state_difference = cvae.get_cvae_obs(traj_data=env.th.traj.data, 
-                                                            traj_state=env_state.additional_carry.traj_state, 
-                                                            # goal_obs=env.obs_container["GoalTrajMimic"], 
-                                                            current_qpos=env_state.data.qpos,
-                                                            current_qvel=env_state.data.qvel,
-                                                            qpos_ind=qpos_ind,
-                                                            qvel_ind=qvel_ind,
-                                                            quat_in_qpos=quat_in_qpos,
-                                                            backend=jnp,)
-                        z, mean, logvar, recon_x = cvae.apply(cvae_state, state_difference, current_state, z_rng)
-                        policy_obs = jnp.concatenate([last_obs, z], axis=-1)
-                    else:
-                        policy_obs = last_obs
-                    state = {'params': train_state.params, 'run_stats': train_state.run_stats}
-                    if config.use_lattice:
-                        state['noise'] = train_state.lattice_noise
-                    y, updates = train_state.apply_fn(state, policy_obs, 
-                                                      mutable=["run_stats", "noise"] if config.use_lattice else ["run_stats"])
-                    *pi, value = y
-                    train_state = train_state.replace(run_stats=updates['run_stats'])  # update stats
-                    action = pi[0].mean()
 
-                    # STEP ENV
-                    obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
+                def _keep_active_lanes(active, previous, candidate):
+                    """Freeze inactive lane leaves; retain newly computed global wrapper leaves.
 
-                    # GET METRICS
-                    log_env_state = env_state.find(LogEnvState)
-                    logged_metrics = log_env_state.metrics
+                    Vectorized environment-state leaves start with the lane axis. Unbatched
+                    scalars (e.g. a reward normalizer's global moments) have no lane axis.
+                    """
+                    batch_size = active.shape[0]
 
-                    transition = MetricHandlerTransition(env_state, logged_metrics)
+                    def choose(old, new):
+                        if hasattr(new, "shape") and new.ndim > 0 and new.shape[0] == batch_size:
+                            mask = active.reshape((batch_size,) + (1,) * (new.ndim - 1))
+                            return jnp.where(mask, new, old)
+                        return new
 
-                    if hasattr(config, "cvae") and config.cvae.use_cvae:
-                        train_state = (train_state, train_state_cvae)
+                    return jax.tree_util.tree_map(choose, previous, candidate)
 
-                    runner_state = (train_state, env_state, obsv, train_state_buffer, rng)
-                    return runner_state, transition
 
-                rng = runner_state[-1]
-                reset_rng = jax.random.split(rng, config.validation.num_envs)
-                obsv, env_state = env.reset(reset_rng)
-                runner_state_eval = (train_state, env_state, obsv, train_state_buffer, rng)
+                def evaluate_trajectory_batches(
+                    *,
+                    reset_to: Callable,
+                    step: Callable,
+                    policy_step: Callable,
+                    read_episode_totals: Callable,
+                    policy_state,
+                    rng,
+                    trajectory_lengths,
+                    num_envs: int,
+                    metric_dtype=jnp.float32,
+                ) -> EvaluationResult:
+                    """Run first attempts using a compiled batch loop and per-batch while loop.
 
-                # do evaluation runs
-                _, traj_batch_eval = jax.lax.scan(
-                    _eval_env, runner_state_eval, None, config.validation.num_steps
+                    Callbacks:
+                    reset_to(keys[B], trajectory_ids[B]) -> (obs, env_state)
+                    step(env_state, actions) -> (obs, reward, absorbing, done, info, env_state)
+                    policy_step(policy_state, obs, env_state, key) -> (actions, policy_state)
+                    read_episode_totals(env_state) -> (raw_episode_return[B], action_size[B])
+
+                    read_episode_totals must choose the completed episode fields on a terminal
+                    step because auto-reset wrappers clear the running episode accumulators.
+                    The reward returned by step is deliberately not used for reported returns.
+                    """
+                    trajectory_lengths = jnp.asarray(trajectory_lengths, dtype=jnp.int32)
+                    n_trajectories = trajectory_lengths.shape[0]  # static shape, not array data
+                    if n_trajectories < 1:
+                        raise ValueError("Evaluation requires at least one reference trajectory.")
+                    if int(num_envs) < 1:
+                        raise ValueError("validation.num_envs must be positive.")
+
+                    batch_size = min(int(num_envs), n_trajectories)
+                    n_full_batches, remainder = divmod(n_trajectories, batch_size)
+                    reference_steps = jnp.maximum(trajectory_lengths - 1, 0)
+                    zeros_f = jnp.zeros((n_trajectories,), dtype=metric_dtype)
+                    zeros_i = jnp.zeros((n_trajectories,), dtype=jnp.int32)
+                    zeros_b = jnp.zeros((n_trajectories,), dtype=jnp.bool_)
+                    initial_result = EvaluationResult(
+                        returns=zeros_f,
+                        lengths=zeros_i,
+                        action_sizes=zeros_f,
+                        absorbing=zeros_b,
+                        environment_done=zeros_b,
+                        completed=zeros_b,
+                        truncated=zeros_b,
+                        reference_steps=reference_steps,
+                    )
+
+                    def run_batch(start_index, lane_count):
+                        ids = jnp.asarray(start_index, jnp.int32) + jnp.arange(lane_count, dtype=jnp.int32)
+                        limits = reference_steps[ids]
+                        batch_key = jax.random.fold_in(rng, start_index)
+                        reset_key, rollout_key = jax.random.split(batch_key)
+                        reset_keys = jax.random.split(reset_key, lane_count)
+                        obs, state = reset_to(reset_keys, ids)
+
+                        initial_carry = (
+                            policy_state, state, obs, rollout_key, limits > 0,
+                            jnp.zeros((lane_count,), metric_dtype),
+                            jnp.zeros((lane_count,), jnp.int32),
+                            jnp.zeros((lane_count,), metric_dtype),
+                            jnp.zeros((lane_count,), jnp.bool_),
+                            jnp.zeros((lane_count,), jnp.bool_),
+                        )
+
+                        def any_active(carry):
+                            return jnp.any(carry[4])
+
+                        def take_step(carry):
+                            local_policy, state, obs, key, active, returns, lengths, sizes, failures, dones = carry
+                            key, action_key = jax.random.split(key)
+                            actions, local_policy = policy_step(local_policy, obs, state, action_key)
+                            actions = jnp.asarray(actions).reshape((lane_count, -1))
+                            action_mask = active.reshape((lane_count,) + (1,) * (actions.ndim - 1))
+                            actions = jnp.where(action_mask, actions, jnp.zeros_like(actions))
+
+                            next_obs, _, absorbing, done, _, next_state = step(state, actions)
+                            absorbing = jnp.asarray(absorbing, jnp.bool_).reshape((lane_count,))
+                            done = jnp.asarray(done, jnp.bool_).reshape((lane_count,))
+                            raw_total, action_total = read_episode_totals(next_state)
+                            raw_total = jnp.asarray(raw_total, metric_dtype).reshape((lane_count,))
+                            action_total = jnp.asarray(action_total, metric_dtype).reshape((lane_count,))
+
+                            # Save only the initial attempt. Terminal totals are read BEFORE
+                            # freezing lanes, and the terminal transition is included exactly once.
+                            returns = jnp.where(active, raw_total, returns)
+                            sizes = jnp.where(active, action_total, sizes)
+                            lengths = lengths + active.astype(jnp.int32)
+                            failures = failures | (active & absorbing)
+                            dones = dones | (active & done)
+                            still_active = active & ~done & ~absorbing & (lengths < limits)
+
+                            state = _keep_active_lanes(active, state, next_state)
+                            obs = _keep_active_lanes(active, obs, next_obs)
+                            return (
+                                local_policy, state, obs, key, still_active,
+                                returns, lengths, sizes, failures, dones,
+                            )
+
+                        final = jax.lax.while_loop(any_active, take_step, initial_carry)
+                        _, _, _, _, _, returns, lengths, sizes, failures, dones = final
+                        completed = (lengths >= limits) & ~failures
+                        truncated = (lengths < limits) & ~failures
+                        return ids, EvaluationResult(
+                            returns, lengths, sizes, failures, dones, completed, truncated, limits,
+                        )
+
+                    def add_batch(result, start_index, lane_count):
+                        ids, batch = run_batch(start_index, lane_count)
+                        return jax.tree_util.tree_map(lambda full, part: full.at[ids].set(part), result, batch)
+
+                    def batch_body(batch_index, result):
+                        return add_batch(result, batch_index * batch_size, batch_size)
+
+                    result = jax.lax.fori_loop(0, n_full_batches, batch_body, initial_result)
+                    if remainder:  # static Python decision; one extra lane shape, no duplicate slots
+                        result = add_batch(result, n_full_batches * batch_size, remainder)
+                    return result
+
+
+                def summarize_evaluation(result: EvaluationResult, template):
+                    """Populate the existing summary type, preserving lax.cond leaf shapes/dtypes.
+
+                    Extra distance outputs are explicitly unavailable (NaN). Other fields not
+                    listed here retain their template values, e.g. losses which are not evaluated.
+                    """
+                    count = result.returns.shape[0]
+                    lengths_f = result.lengths.astype(result.returns.dtype)
+                    values = {
+                        "mean_episode_return": jnp.mean(result.returns),
+                        "mean_episode_length": jnp.mean(lengths_f),
+                        "mean_episode_action_size": jnp.mean(result.action_sizes),
+                        "var_episode_return": jnp.var(result.returns),
+                        "var_episode_length": jnp.var(lengths_f),
+                        "max_episode_return": jnp.max(result.returns),
+                        "min_episode_return": jnp.min(result.returns),
+                        "max_episode_length": jnp.max(result.lengths),
+                        "min_episode_length": jnp.min(result.lengths),
+                        "num_episodes": jnp.asarray(count, jnp.int32),
+                        "absorbing_episodes": jnp.sum(result.absorbing),
+                        # Preserve the existing meaning: success is absence of absorbing failure.
+                        # result.completed separately distinguishes completion from horizon truncation.
+                        "success_rate": jnp.mean((~result.absorbing).astype(result.returns.dtype)),
+                        # Here this field reports the total number of scored validation steps.
+                        "max_timestep": jnp.sum(result.lengths),
+                    }
+                    updates = {}
+                    for name, value in values.items():
+                        if hasattr(template, name):
+                            target = jnp.asarray(getattr(template, name))
+                            updates[name] = jnp.broadcast_to(jnp.asarray(value, dtype=target.dtype), target.shape)
+
+                    # Use the actual custom summary's field names, including optional cosine distance.
+                    for name in getattr(template, "__dataclass_fields__", {}):
+                        if "distance" in name or "warping" in name:
+                            def unavailable(leaf):
+                                array = jnp.asarray(leaf)
+                                if jnp.issubdtype(array.dtype, jnp.inexact):
+                                    return jnp.full_like(array, jnp.nan)
+                                return array
+                            updates[name] = jax.tree_util.tree_map(unavailable, getattr(template, name))
+
+                    return template.replace(**updates)
+
+
+                def evaluate_all_trajectories(
+                    *,
+                    env,
+                    train_state,
+                    rng,
+                    num_envs: int,
+                    summary_template,
+                    log_env_state_type,
+                    cvae=None,
+                    current_state_idx=None,
+                    qpos_ind=None,
+                    qvel_ind=None,
+                    quat_in_qpos=None,
+                    episode_action_size_getter=None,
+                ):
+                    """Adapter for the actor/CVAE interfaces in the user's attached PPOJax code.
+
+                    Returns (validation_summary, EvaluationResult). This reuses the environment
+                    already bound to the training function's dynamic trajectory data.
+
+                    Optional episode_action_size_getter(metrics) returns the current episode's
+                    action-size statistic, selecting completed fields on metrics.done and
+                    applying the branch's exact units/normalization to running fields otherwise.
+                    """
+                    if cvae is not None and any(
+                        value is None for value in (current_state_idx, qpos_ind, qvel_ind, quat_in_qpos)
+                    ):
+                        raise ValueError("CVAE evaluation requires the observation and joint-index arrays.")
+
+                    def policy_step(local_train_state, obs, env_state, key):
+                        if cvae is not None:
+                            policy_state, cvae_state = local_train_state
+                            current_state = obs[..., current_state_idx]
+                            state_difference = cvae.get_cvae_obs(
+                                th=env.th,
+                                traj_state=env_state.additional_carry.traj_state,
+                                current_qpos=env_state.data.qpos,
+                                current_qvel=env_state.data.qvel,
+                                qpos_ind=qpos_ind,
+                                qvel_ind=qvel_ind,
+                                quat_in_qpos=quat_in_qpos,
+                                backend=jnp,
+                            )
+                            cvae_output, cvae_updates = cvae.apply(
+                                {"params": cvae_state.params, "run_stats": cvae_state.run_stats},
+                                state_difference, current_state, key, mutable=["run_stats"],
+                            )
+                            z = cvae_output[0]
+                            z = jnp.asarray(z).reshape((obs.shape[0], -1))
+                            policy_obs = jnp.concatenate([obs, z], axis=-1)
+                            cvae_state = cvae_state.replace(run_stats=cvae_updates["run_stats"])
+                        else:
+                            policy_state = local_train_state
+                            policy_obs = obs
+
+                        output, updates = policy_state.apply_fn(
+                            {"params": policy_state.params, "run_stats": policy_state.run_stats},
+                            policy_obs, mutable=["run_stats"],
+                        )
+                        pi, _ = output
+                        actions = jnp.asarray(pi.mean()).reshape((obs.shape[0], -1))
+                        policy_state = policy_state.replace(run_stats=updates["run_stats"])
+                        local_train_state = (policy_state, cvae_state) if cvae is not None else policy_state
+                        return actions, local_train_state
+
+                    def read_episode_totals(state):
+                        metrics = state.find(log_env_state_type).metrics
+                        episode_return = jnp.where(
+                            metrics.done, metrics.returned_episode_returns, metrics.episode_returns,
+                        )
+                        # Prefer an exact branch-specific accessor when supplied. In the usual
+                        # cumulative-field convention, running/completed values share units.
+                        if episode_action_size_getter is not None:
+                            action_size = episode_action_size_getter(metrics)
+                        elif hasattr(metrics, "returned_episode_action_sizes"):
+                            running_size = getattr(
+                                metrics, "episode_action_sizes", jnp.full_like(episode_return, jnp.nan),
+                            )
+                            action_size = jnp.where(
+                                metrics.done,
+                                metrics.returned_episode_action_sizes,
+                                running_size,
+                            )
+                        else:
+                            action_size = jnp.full_like(episode_return, jnp.nan)
+                        return episode_return, action_size
+
+                    # split_points is dynamic array data, while its shape gives a static count.
+                    split_points = env.th.traj.data.split_points
+                    trajectory_lengths = split_points[1:] - split_points[:-1]
+                    dtype = jnp.asarray(summary_template.mean_episode_return).dtype
+                    if not jnp.issubdtype(dtype, jnp.inexact):
+                        dtype = jnp.float32
+
+                    result = evaluate_trajectory_batches(
+                        reset_to=env.reset_to,
+                        step=env.step,
+                        policy_step=policy_step,
+                        read_episode_totals=read_episode_totals,
+                        policy_state=train_state,
+                        rng=rng,
+                        trajectory_lengths=trajectory_lengths,
+                        num_envs=num_envs,
+                        metric_dtype=dtype,
+                    )
+                    return summarize_evaluation(result, summary_template), result
+
+                use_cvae = hasattr(config, "cvae") and config.cvae.use_cvae
+
+                validation_metrics, evaluation_details = evaluate_all_trajectories(
+                    env=eval_env,
+                    train_state=train_state,
+                    rng=jax.random.fold_in(runner_state[-1], counter),
+                    num_envs=int(config.validation.num_envs),
+                    summary_template=mh.get_zero_container(),
+                    log_env_state_type=LogEnvState,
+                    cvae=cvae if use_cvae else None,
+                    current_state_idx=current_state_idx,
+                    qpos_ind=qpos_ind,
+                    qvel_ind=qvel_ind,
+                    quat_in_qpos=quat_in_qpos,
                 )
 
-                env_states = traj_batch_eval.env_state
+                # One boolean per trajectory, already in original order.
+                failed = jnp.asarray(
+                    evaluation_details.absorbing,
+                    dtype=jnp.bool_,
+                )
 
-                validation_metrics = mh(env_states)
+                if failed.shape != eval_failure_counts.shape:
+                    raise ValueError(
+                        "Evaluation and training trajectory IDs must match."
+                    )
+
+                # Add at most one failure per trajectory per evaluation.
+                next_failure_counts = (
+                    eval_failure_counts
+                    + failed.astype(eval_failure_counts.dtype)
+                )
+
+                # Update the live TRAINING environment state.
+                next_env_state = env_state
+
+                if biased_sampling:
+                    next_env_state = refresh_sampling(
+                        env_state,
+                        next_failure_counts,
+                        jnp.any(failed),
+                    )
 
                 jax.debug.callback(cls.log_val_wandb, validation_metrics, config.num_steps * config.num_envs * counter)
 
-                return validation_metrics
+                return validation_metrics, next_env_state, next_failure_counts
 
             if mh is None:
                 validation_metrics = ValidationSummary()
             else:
-                validation_metrics = jax.lax.cond(counter % config.validation_interval == 0, _evaluation_step,
-                                                   mh.get_zero_container)
+                validation_metrics, env_state, eval_failure_counts = jax.lax.cond(counter % config.validation_interval == 0, _evaluation_step,
+                                                   lambda: (mh.get_zero_container(), env_state, eval_failure_counts))
 
             if config.debug:
                 def callback(metrics):
@@ -675,63 +1008,20 @@ class PPOJax(JaxRLAlgorithmBase):
 
                 jax.debug.callback(callback, env_state.metrics)
 
-            def refresh_sampling(
-                state: Any,
-            ) -> Any:
-                """Refresh shared probabilities from this window's local failure counts.
-
-                Requirements:
-                    - Call outside the environment-level vmap.
-                    - Counts and probabilities have shape (num_envs, num_trajectories).
-                    - Probability rows are identical, finite, and normalized.
-
-                With no failures, retain the previous probabilities.
-                """
-                def replace_carry(state: Any, new_carry: Any) -> Any:
-                    """Replace the underlying carry without changing other wrapper fields."""
-                    if isinstance(state, MjxState):
-                        return state.replace(additional_carry=new_carry)
-
-                    if isinstance(state, BaseWrapperState):
-                        return state.replace(
-                            env_state=replace_carry(state.env_state, new_carry)
-                        )
-
-                    raise TypeError(f"Unsupported state type: {type(state).__name__}")
-
-                carry = state.additional_carry
-                failure_counts = carry.failure_counts
-                old_probs = carry.log_probs
-
-                # Aggregate independent per-environment counters.
-                totals = failure_counts.astype(old_probs.dtype).sum(axis=0) + 1.0
-                total_failures = totals.sum()
-
-                # Calculate probabilities and update carry
-                failure_probs = totals / total_failures
-                new_carry = carry.replace(
-                    failure_counts=jnp.zeros_like(failure_counts),
-                    log_probs=jnp.broadcast_to(jnp.log(failure_probs), old_probs.shape),
-                )
-                return replace_carry(state, new_carry)
-
-            # update sampling
-            if config.env_params.th_params.biased_sampling:
-                env_state = refresh_sampling(env_state)
-
             # add train state to buffer if needed
             train_state_buffer = jax.lax.cond(counter % config.validation_interval == 0,
                                               lambda x, y: TrainStateBuffer.add(x, y),
                                               lambda x, y: x, train_state_buffer, train_state)
 
             runner_state = (train_state, env_state, last_obs, train_state_buffer, rng)
-            return runner_state, (metric, validation_metrics)
+            return (runner_state, eval_failure_counts), (metric, validation_metrics)
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, train_state_buffer, _rng)
         runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, jnp.arange(config.num_updates)
+            _update_step, (runner_state, eval_failure_counts), jnp.arange(config.num_updates)
         )
+        runner_state, eval_failure_counts = runner_state
 
         agent_state = cls._agent_state(train_state=runner_state[0])
 

@@ -73,7 +73,7 @@ class Mjx(Mujoco):
         data = mjx.put_data(self._model, self._data)
         self._first_data = mjx.forward(self.sys, data)
 
-    def mjx_reset(self, key: jax.random.PRNGKey) -> MjxState:
+    def mjx_reset(self, key: jax.random.PRNGKey, traj_idx: jax.Array | None = None) -> MjxState:
         """
         Resets the environment.
 
@@ -91,6 +91,11 @@ class Mjx(Mujoco):
         data = self._first_data
 
         carry = self._init_additional_carry(key, self._model, data, jnp)
+
+        if traj_idx is not None and hasattr(carry, "selected_traj_idx"):
+            carry = carry.replace(
+                selected_traj_idx=jnp.asarray(traj_idx, dtype=jnp.int32),
+            )
 
         data, carry = self._mjx_reset_carry(self.sys, data, carry)
 

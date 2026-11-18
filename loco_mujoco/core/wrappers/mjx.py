@@ -26,6 +26,10 @@ class LocoMjxWrapper:
         state = self.env.mjx_reset(rng_key)
         return state.observation, state
 
+    def reset_to(self, rng_key, traj_idx):
+        state = self.env.mjx_reset(rng_key, traj_idx=traj_idx)
+        return state.observation, state
+
     def step(self, state, action):
         next_state = self.env.mjx_step(state, action)
         next_obs = jnp.where(next_state.done, next_state.additional_carry.final_observation, next_state.observation)
@@ -69,6 +73,9 @@ class BaseWrapper:
 
     def reset(self, rng_key):
         return self.env.reset(rng_key)
+
+    def reset_to(self, rng_key, traj_idx):
+        return self.env.reset_to(rng_key, traj_idx)
 
     def step(self, state, action):
         return self.env.step(state, action)
@@ -237,6 +244,18 @@ class NormalizeVecReward(BaseWrapper):
 
     def reset(self, key):
         obs, state = self.env.reset(key)
+        batch_count = obs.shape[0]
+        state = NormalizeVecRewEnvState(
+            mean=0.0,
+            var=1.0,
+            count=1e-4,
+            return_val=jnp.zeros((batch_count,)),
+            env_state=state,
+        )
+        return obs, state
+
+    def reset_to(self, key, traj_idx):
+        obs, state = self.env.reset_to(key, traj_idx)
         batch_count = obs.shape[0]
         state = NormalizeVecRewEnvState(
             mean=0.0,
